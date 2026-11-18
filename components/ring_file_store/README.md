@@ -32,7 +32,8 @@ cfg.recordSize = sizeof(meterRecord_t);
 cfg.key = (ringFileKeyDescriptor_t){
   .keyOffset = offsetof(meterRecord_t, timestamp),
   .keyType = RING_FILE_KEY_U64,
-  .keySize = sizeof(uint64_t)
+  .keySize = sizeof(uint64_t),
+  .keyPositionMask = 0   //-- 0: all byte positions significant
 };
 
 ringFileHandle_t *ring = NULL;
@@ -58,6 +59,7 @@ ringFileClose(ring);
 | `ringFileUpsert` | Atomic update-or-add under the handle lock (the hourly-logger pattern). |
 | `ringFileReadOldest` / `ringFileReadNewest` | First/last record in insertion order. |
 | `ringFileIteratorBegin/Next/Previous` | Caller-owned cursors; start at oldest, newest or an exact key; traverse either direction; `ITER_END` at the logical ends; successful mutations invalidate cursors. |
+| `ringFileIteratorGetSlot` | Physical slot index of the record the cursor last returned (`RING_FILE_SLOT_STAGED` for an unflushed staged record). For diagnostics and test logging. |
 | `ringFileResize` | Change capacity through a verified candidate file plus an atomic rename switch. Shrink keeps the newest records that fit. Capacity ≥ 1. Persists the new capacity. |
 | `ringFileGetInfo` | count, capacity, record size, schema, storage size, pending count, dirty. |
 | `ringFileSync` | Commit pending buffered data and synchronize through the backend. |
@@ -109,6 +111,9 @@ write nothing.
   String keys are fixed-size char arrays, compared case-sensitively with
   bytes after the first terminator ignored; an unterminated key buffer is
   rejected with `ESP_ERR_INVALID_ARG`.
+* When `keyPositionMask` is set, bytes at insignificant positions may hold
+  any value: comparisons (duplicate check on add, keyed lookup, update key
+  match, upsert, iterator-by-key) only consider the marked byte positions.
 * Records must be pointer-free, fixed-width-field structs. Payloads are
   stored as raw bytes: reopening requires the same payload layout, ABI and
   little-endian byte order. Any layout change requires a new
@@ -121,11 +126,21 @@ write nothing.
 width), `RING_FILE_KEY_BYTES` (fixed-size byte array, exact equality),
 `RING_FILE_KEY_STRING` (bounded null-terminated, case-sensitive).
 
+`keyPositionMask` selects the significant byte positions of the key: bit
+`i` set means byte position `i` takes part in every key comparison,
+cleared bits are ignored (two keys differing only there are equal). `0`
+means all positions significant. A non-zero mask requires `keySize <= 64`
+and no set bit at or beyond `keySize`. The mask is persisted in the file
+header as part of the schema; changing it requires a new `schemaVersion`.
+Example: a `uint64_t` timestamp key with mask `0xFC` compares only bytes
+2..7, so samples that differ only in the low second-bits address the same
+record.
+
 ## Binary format
 
 ```
-offset 0        [ 64-byte header ]
-offset 64       [ slot 0 ][ slot 1 ] ... [ slot capacity ]   (capacity + 1 slots)
+offset 0        [ 96-byte header ]
+offset 96       [ slot 0 ][ slot 1 ] ... [ slot capacity ]   (capacity + 1 slots)
 ```
 
 All metadata is explicitly little-endian encoded; compiler struct padding
@@ -136,8 +151,8 @@ Header (written only by create, resize and clear):
 | Offset | Size | Field |
 | --- | --- | --- |
 | 0 | u32 | magic `RFS1` (0x52465331) |
-| 4 | u16 | format version (1) |
-| 6 | u16 | header size (64) |
+| 4 | u16 | format version (2) |
+| 6 | u16 | header size (96) |
 | 8 | u64 | generation (incremented per resize) |
 | 16 | u32 | schema id |
 | 20 | u32 | schema version |
@@ -148,8 +163,10 @@ Header (written only by create, resize and clear):
 | 40 | u32 | key size |
 | 44 | u32 | flags (0) |
 | 48 | u64 | epoch (records with seq < epoch are hidden; set by `ringFileClear`) |
-| 56 | u32 | CRC32 over bytes [0,56) |
-| 60 | u32 | reserved (0xFFFFFFFF) |
+| 56 | u64 | key position mask (0 = all positions significant) |
+| 64 | 24 B | reserved (0xFFFFFFFF) |
+| 88 | u32 | CRC32 over bytes [0,88) |
+| 92 | u32 | reserved (0xFFFFFFFF) |
 
 Slot header (20 bytes) followed by `recordSize` raw record bytes:
 
@@ -184,7 +201,7 @@ committed state** — never a mix. Redundant old copies of edited keys also
 give a second candidate to the reopen logic. The extra (capacity + 1)th
 slot is the invariant guarantor of a free scratch slot.
 
-Header block (create/resize/clear) is a single 64-byte write; on LittleFS
+Header block (create/resize/clear) is a single 96-byte write; on LittleFS
 this lands inside one COW block commit, on FATFS it is not atomic —
 a damaged header is reported as `..._ERR_CORRUPT` (a checksum detects
 corruption but cannot reconstruct; see durability).
@@ -206,7 +223,7 @@ leftovers; main file missing/damaged and `path.rfsold` valid → restore it
 A second rename failure is rolled back immediately; if the rollback also
 fails the handle quarantines and the next writable open recovers the
 complete previous state. Temporary storage: about
-`64 + (retained + 1) × slotSize` bytes free on the volume. If the volume
+`96 + (retained + 1) × slotSize` bytes free on the volume. If the volume
 is full the original is untouched and `..._ERR_STORAGE_FULL` (or
 `..._ERR_IO`) is returned.
 
@@ -334,7 +351,9 @@ idf.py build
 ```
 
 The host suite injects failures at every write, sync and rename boundary
-and verifies the reopened state; see `test/README.md`.
+and verifies the reopened state; see `test/README.md`. It also writes
+`testLog.md` (repository root) with every logged command, its result, and
+ring dumps showing key and slot number per record.
 
 ## ESP Component Registry
 

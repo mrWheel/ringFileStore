@@ -1,4 +1,9 @@
-//-- Host-side automated tests for the ring_file_store component.
+//--
+//-- FileVersion: [2] 18-11-2026 - 19:05
+//--
+//-- ringFileStore - host-side automated tests for the ring_file_store
+//-- component.
+//-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
 //--
 //-- The component sources are compiled against small POSIX shims
 //-- (shim/) so the whole suite runs on the dev machine. Storage failures
@@ -10,9 +15,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "esp_err.h"
@@ -256,6 +263,116 @@ typedef struct
   uint32_t value;
 } keyedRec_t;
 
+typedef struct
+{
+  uint8_t raw[80];
+  uint32_t value;
+} bigRec_t;
+
+//-- ---------------------------------------------------------------------------
+//-- testLog.md writer: one "Command" line (with its data) followed by its
+//-- "Result", plus ring dumps showing key and physical slot. Path comes
+//-- from argv[1] (run_tests.sh passes the repository root).
+//-- ---------------------------------------------------------------------------
+
+static FILE *gLog = NULL;
+
+static void logLine(const char *fmt, ...)
+{
+  if (gLog == NULL)
+  {
+    return;
+  }
+
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(gLog, fmt, ap);
+  va_end(ap);
+  fprintf(gLog, "\n");
+}
+
+static void logCmd(esp_err_t result, const char *fmt, ...)
+{
+  if (gLog == NULL)
+  {
+    return;
+  }
+
+  char text[320];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(text, sizeof(text), fmt, ap);
+  va_end(ap);
+  logLine("- **Command:** %s", text);
+  logLine("  **Result:** %s", esp_err_to_name(result));
+}
+
+static void logCmdText(const char *resultText, const char *fmt, ...)
+{
+  if (gLog == NULL)
+  {
+    return;
+  }
+
+  char text[320];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(text, sizeof(text), fmt, ap);
+  va_end(ap);
+  logLine("- **Command:** %s", text);
+  logLine("  **Result:** %s", resultText);
+}
+
+static void logRingDump(ringFileHandle_t *h, const char *step)
+{
+  if (gLog == NULL)
+  {
+    return;
+  }
+
+  ringFileInfo_t info;
+  memset(&info, 0, sizeof(info));
+  ringFileGetInfo(h, &info);
+  logLine("- **Command:** ring dump after \"%s\" (count=%lu capacity=%lu, oldest → newest)",
+          step, (unsigned long)info.count, (unsigned long)info.capacity);
+
+  ringFileIterator_t it;
+  meterRec_t rec;
+  memset(&it, 0, sizeof(it));
+  memset(&rec, 0, sizeof(rec));
+
+  if (ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &rec) != ESP_OK)
+  {
+    logLine("  **Result:** ring is empty");
+    return;
+  }
+
+  for (;;)
+  {
+    uint32_t slot = RING_FILE_SLOT_STAGED;
+    ringFileIteratorGetSlot(h, &it, &slot);
+
+    if (slot == RING_FILE_SLOT_STAGED)
+    {
+      logLine("  - slot **staged** (not yet on storage) key=%llu "
+              "energyWh=%lu errorCount=%u",
+              (unsigned long long)rec.timestamp, (unsigned long)rec.energyWh,
+              (unsigned)rec.errorCount);
+    }
+    else
+    {
+      logLine("  - slot %lu key=%llu energyWh=%lu errorCount=%u",
+              (unsigned long)slot, (unsigned long long)rec.timestamp,
+              (unsigned long)rec.energyWh, (unsigned)rec.errorCount);
+    }
+
+    if (ringFileIteratorNext(h, &it, &rec) != ESP_OK)
+    {
+      break;
+    }
+  }
+}
+
 static void ringPath(char *out, size_t size, const char *name)
 {
   snprintf(out, size, "%s/%s.rfs", sDir, name);
@@ -408,7 +525,7 @@ static void copyFile(const char *src, const char *dst)
 }
 
 #define SLOT_HDR_SIZE 20u
-#define HEADER_SIZE 64u
+#define HEADER_SIZE 96u
 
 static size_t slotRecordOffset(uint32_t index, uint32_t recordSize)
 {
@@ -1545,7 +1662,209 @@ static void testValidateGoodRing(void)
   CHECK(!v.strayResizeFiles);
 }
 
-int main(void)
+//-- Ring with more records (capacity 10): fills the ring, wraps twice,
+//-- updates a middle record and verifies insertion order. Every command
+//-- (with its data) and its result, plus the key/slot dumps, go to
+//-- testLog.md.
+static void testMoreRecords(void)
+{
+  ringFileHandle_t *h = mustCreate("more10", 10);
+  meterRec_t rec, out;
+
+  for (uint64_t i = 1; i <= 12; i++)
+  {
+    uint64_t ts = i * 100;
+    mkMeter(&rec, ts, (uint32_t)(i * 10), (uint16_t)i);
+    esp_err_t err = ringFileAdd(h, &rec);
+    char step[64];
+    snprintf(step, sizeof(step), "add key=%llu", (unsigned long long)ts);
+    logCmd(err, "ringFileAdd(key=%llu, energyWh=%lu, errorCount=%u) "
+           "on a capacity-10 ring", (unsigned long long)ts,
+           (unsigned long)(i * 10), (unsigned)i);
+    CHECK_ERR(err, ESP_OK);
+    logRingDump(h, step);
+  }
+
+  CHECK(infoCount(h) == 10);
+
+  //-- The 11th and 12th add evicted exactly the two oldest (100 and 200).
+  uint64_t k = 100;
+  esp_err_t err = ringFileReadByKey(h, &k, &out);
+  CHECK_ERR(err, RING_FILE_STORE_ERR_KEY_NOT_FOUND);
+  logCmd(err, "ringFileReadByKey(key=100) — evicted by the 11th add");
+  k = 200;
+  err = ringFileReadByKey(h, &k, &out);
+  CHECK_ERR(err, RING_FILE_STORE_ERR_KEY_NOT_FOUND);
+  logCmd(err, "ringFileReadByKey(key=200) — evicted by the 12th add");
+
+  for (uint64_t i = 3; i <= 12; i++)
+  {
+    k = i * 100;
+    err = ringFileReadByKey(h, &k, &out);
+    CHECK_ERR(err, ESP_OK);
+    CHECK(out.energyWh == (uint32_t)(i * 10));
+  }
+
+  logCmdText("keys 300..1200 active, energyWh correct",
+             "ringFileReadByKey for all 10 active keys (300..1200)");
+
+  err = ringFileReadOldest(h, &out);
+  CHECK_ERR(err, ESP_OK);
+  CHECK(out.timestamp == 300);
+  logCmd(err, "ringFileReadOldest()");
+
+  err = ringFileReadNewest(h, &out);
+  CHECK_ERR(err, ESP_OK);
+  CHECK(out.timestamp == 1200);
+  logCmd(err, "ringFileReadNewest()");
+
+  //-- Update a middle record: position must be preserved.
+  k = 500;
+  mkMeter(&rec, 500, 999, 7);
+  err = ringFileUpdateByKey(h, &k, &rec);
+  CHECK_ERR(err, ESP_OK);
+  logCmd(err, "ringFileUpdateByKey(key=500, energyWh=999, errorCount=7) "
+         "— position preserved");
+  logRingDump(h, "update key=500");
+
+  k = 500;
+  err = ringFileReadByKey(h, &k, &out);
+  CHECK_ERR(err, ESP_OK);
+  CHECK(out.energyWh == 999 && out.errorCount == 7);
+
+  ringFileClose(h);
+
+  //-- Reopen: same 10 keys, same insertion order.
+  h = mustOpen("more10", false);
+  CHECK(infoCount(h) == 10);
+  logRingDump(h, "reopen after close");
+  ringFileClose(h);
+}
+
+//-- Significant key positions: the keyPositionMask marks which byte
+//-- positions of the key take part in every comparison.
+static void testKeyPositionMask(void)
+{
+  //-- Bit i set marks byte position i as significant: for the 8-byte
+  //-- timestamp key only bytes 2..7 take part; bytes 0 and 1 are ignored.
+  static const uint64_t maskValue = 0x00000000000000FCULL;
+  char path[300];
+  ringPath(path, sizeof(path), "keymask");
+  ringFileConfig_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.maxRecords = 4;
+  cfg.schemaId = 3;
+  cfg.schemaVersion = 1;
+  cfg.recordSize = sizeof(meterRec_t);
+  cfg.key.keyOffset = (uint32_t)offsetof(meterRec_t, timestamp);
+  cfg.key.keyType = RING_FILE_KEY_U64;
+  cfg.key.keySize = (uint16_t)sizeof(uint64_t);
+  cfg.key.keyPositionMask = maskValue;
+  cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
+
+  ringFileHandle_t *h = NULL;
+  esp_err_t err = ringFileCreate(path, &cfg, &h);
+  CHECK_ERR(err, ESP_OK);
+  logCmd(err, "ringFileCreate(capacity=4, key=timestamp u64, "
+         "keyPositionMask=0x%016llx: byte positions 0-1 not significant)",
+         (unsigned long long)maskValue);
+
+  ringFileInfo_t info;
+  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
+  CHECK(info.keyPositionMask == maskValue);
+
+  meterRec_t rec, out;
+  uint64_t base = 0x12340001ULL;
+  mkMeter(&rec, base, 10, 0);
+  err = ringFileAdd(h, &rec);
+  CHECK_ERR(err, ESP_OK);
+  logCmd(err, "ringFileAdd(key=0x%016llx)", (unsigned long long)base);
+
+  //-- Differs only at insignificant positions → same key → duplicate.
+  uint64_t same = 0x123400ABULL;
+  mkMeter(&rec, same, 20, 0);
+  err = ringFileAdd(h, &rec);
+  CHECK_ERR(err, RING_FILE_STORE_ERR_DUPLICATE_KEY);
+  logCmd(err, "ringFileAdd(key=0x%016llx: only bytes 0-1 differ)",
+         (unsigned long long)same);
+
+  uint64_t look = 0x123400FFULL;
+  err = ringFileReadByKey(h, &look, &out);
+  CHECK_ERR(err, ESP_OK);
+  CHECK(out.energyWh == 10);
+  logCmd(err, "ringFileReadByKey(key=0x%016llx) finds key=0x%016llx "
+         "(byte 0 ignored)", (unsigned long long)look,
+         (unsigned long long)base);
+
+  uint64_t other = 0x12350000ULL;
+  err = ringFileReadByKey(h, &other, &out);
+  CHECK_ERR(err, RING_FILE_STORE_ERR_KEY_NOT_FOUND);
+  logCmd(err, "ringFileReadByKey(key=0x%016llx): byte 2 (significant) "
+         "differs", (unsigned long long)other);
+
+  //-- Embedded key differing from the lookup key only in insignificant
+  //-- positions is accepted.
+  uint64_t lk = 0x12340002ULL;
+  mkMeter(&rec, 0x12340003ULL, 33, 1);
+  err = ringFileUpdateByKey(h, &lk, &rec);
+  CHECK_ERR(err, ESP_OK);
+  logCmd(err, "ringFileUpdateByKey(key=0x%016llx, embedded key "
+         "0x%016llx: only byte 0 differs): accepted",
+         (unsigned long long)lk, (unsigned long long)0x12340003ULL);
+
+  uint64_t back = 0x12340001ULL;
+  err = ringFileReadByKey(h, &back, &out);
+  CHECK_ERR(err, ESP_OK);
+  CHECK(out.energyWh == 33 && out.errorCount == 1);
+  logCmd(err, "ringFileReadByKey(key=0x%016llx) shows the update",
+         (unsigned long long)back);
+
+  logRingDump(h, "keymask scenario (adds, duplicate, update)");
+  ringFileClose(h);
+
+  //-- Reopen: the mask is restored from the header and keeps working.
+  ringFileOpenConfig_t ocfg;
+  memset(&ocfg, 0, sizeof(ocfg));
+  ocfg.expectedSchemaId = 3;
+  ocfg.expectedSchemaVersion = 1;
+  ocfg.expectedRecordSize = sizeof(meterRec_t);
+  err = ringFileOpen(path, &ocfg, &h);
+  CHECK_ERR(err, ESP_OK);
+  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
+  CHECK(info.keyPositionMask == maskValue);
+  err = ringFileReadByKey(h, &look, &out);
+  CHECK_ERR(err, ESP_OK);
+  logCmd(err, "reopen: keyPositionMask from header, "
+         "readByKey(0x%016llx) finds the record", (unsigned long long)look);
+  ringFileClose(h);
+
+  //-- Invalid masks are rejected at create time.
+  ringPath(path, sizeof(path), "keymaskbad1");
+  cfg = meterConfig(3);
+  cfg.key.keyPositionMask = 0x1FFULL; //-- bit 8 set while keySize is 8
+  err = ringFileCreate(path, &cfg, &h);
+  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
+  logCmd(err, "ringFileCreate keyPositionMask=0x1FF (bit beyond "
+         "keySize=8) -> rejected");
+
+  ringPath(path, sizeof(path), "keymaskbad2");
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.maxRecords = 3;
+  cfg.schemaId = 3;
+  cfg.schemaVersion = 1;
+  cfg.recordSize = sizeof(bigRec_t);
+  cfg.key.keyOffset = 0;
+  cfg.key.keyType = RING_FILE_KEY_BYTES;
+  cfg.key.keySize = 80;
+  cfg.key.keyPositionMask = 1;
+  cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
+  err = ringFileCreate(path, &cfg, &h);
+  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
+  logCmd(err, "ringFileCreate BYTES keySize=80 with keyPositionMask "
+         "(mask limited to positions 0-63) -> rejected");
+}
+
+int main(int argc, char *argv[])
 {
   snprintf(sDir, sizeof(sDir), "/tmp/rfs_test_XXXXXX");
 
@@ -1585,15 +1904,66 @@ int main(void)
     {"bufferedOverflowFlushes", testBufferedOverflowFlushes},
     {"multipleFiles", testMultipleFiles},
     {"validateGoodRing", testValidateGoodRing},
+    {"moreRecords", testMoreRecords},
+    {"keyPositionMask", testKeyPositionMask},
   };
+
+  //-- testLog.md: path from argv[1] so run_tests.sh can place it in the
+  //-- repository root. The log records every logged Opdracht (with data),
+  //-- its Resultaat, the key/slot dumps and a per-test overview table.
+  const char *logPath = (argc > 1) ? argv[1] : "testLog.md";
+  gLog = fopen(logPath, "w");
+
+  if (gLog == NULL)
+  {
+    printf("  WARN cannot open test log %s: %s\n", logPath, strerror(errno));
+  }
+  else
+  {
+    char stamp[64];
+    time_t now = time(NULL);
+    strftime(stamp, sizeof(stamp), "%d-%m-%Y - %H:%M", localtime(&now));
+    logLine("# ringFileStore — test log (host suite)");
+    logLine("");
+    logLine("Generated: %s — host tests with POSIX shims and "
+            "failure-injection.", stamp);
+    logLine("");
+    logLine("Per line: **Command** (with data) and its **Result**; "
+            "ring dumps show the key and the physical slot number per "
+            "record.");
+    logLine("");
+    logLine("| Test | checks | failures |");
+    logLine("| --- | ---: | ---: |");
+  }
 
   for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
   {
     gTestName = tests[i].name;
     installHooks();
+    int checksBefore = gChecks;
+    int failuresBefore = gFailures;
+    logLine("");
+    logLine("## Test: %s", tests[i].name);
     tests[i].fn();
+    logLine("- **Test result:** %d checks, %d new failures",
+            gChecks - checksBefore, gFailures - failuresBefore);
+    logLine("| %s | %d | %d |", tests[i].name, gChecks - checksBefore,
+            gFailures - failuresBefore);
     printf("  %-28s %d checks, %d failures so far\n", tests[i].name, gChecks,
            gFailures);
+  }
+
+  logLine("");
+  logLine("## Summary");
+  logLine("");
+  logLine("**%s**: %d checks, %d failures.", gFailures == 0 ? "PASS" : "FAIL",
+          gChecks, gFailures);
+
+  if (gLog != NULL)
+  {
+    fclose(gLog);
+    gLog = NULL;
+    printf("  test log written to %s\n", logPath);
   }
 
   printf("\n%s: %d checks, %d failures\n", gFailures == 0 ? "PASS" : "FAIL",

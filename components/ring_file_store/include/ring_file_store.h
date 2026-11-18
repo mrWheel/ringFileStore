@@ -1,3 +1,9 @@
+//--
+//-- FileVersion: [2] 18-11-2026 - 19:05
+//--
+//-- ringFileStore - public C API of the ring_file_store component.
+//-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//--
 #ifndef RING_FILE_STORE_H
 #define RING_FILE_STORE_H
 
@@ -10,7 +16,7 @@
 //-- consume no storage.
 //--
 //-- Storage model (see README.md for the full binary format):
-//--   [ 64-byte header ] [ capacity + 1 slots ]
+//--   [ 96-byte header ] [ capacity + 1 slots ]
 //-- Every mutation commits by writing exactly one slot image. The committed
 //-- state is derived from per-slot metadata (sequence number, revision,
 //-- CRC32), so an interrupted write can never destroy the previous
@@ -98,6 +104,16 @@ typedef struct
   ringFileKeyType_t keyType;
   uint16_t keySize;        //-- bytes occupied by the key in the record.
                            //-- Integer types: must equal the type width.
+  //-- Bitmask of significant byte positions of the key. Bit i (value 1<<i)
+  //-- set means byte position i takes part in key comparisons; cleared bits
+  //-- are ignored, so keys differing only in cleared positions are equal.
+  //-- 0 means all positions are significant (the default). When non-zero:
+  //-- keySize must be <= 64 and no bit at a position >= keySize may be set.
+  //-- The mask is part of the stored schema (persisted in the file header);
+  //-- changing it requires a new schemaVersion. It applies to every key
+  //-- comparison: duplicate check on add, keyed lookup, update key match,
+  //-- upsert and iterator-by-key start.
+  uint64_t keyPositionMask;
 } ringFileKeyDescriptor_t;
 
 //-- Persistence mode.
@@ -150,6 +166,8 @@ typedef struct
   uint64_t storageSize;            //-- header + (capacity + 1) * slotSize.
   uint32_t pendingCount;           //-- staged, not yet committed records.
   bool dirty;                      //-- uncommitted changes outstanding.
+  uint64_t keyPositionMask;        //-- from the file header (0 = all
+                                   //-- positions significant).
 } ringFileInfo_t;
 
 //-- Result of ringFileValidate(). Read-only integrity inspection.
@@ -182,8 +200,15 @@ typedef struct
 {
   uint64_t cursorSeq;              //-- internal: seq of the last returned record.
   uint32_t stamp;                  //-- internal: mutation generation.
+  uint32_t slot;                   //-- internal: physical slot of the last
+                                   //-- returned record (RING_FILE_SLOT_STAGED
+                                   //-- for a staged record).
   bool begun;                      //-- internal: begin() completed.
 } ringFileIterator_t;
+
+//-- ringFileIteratorGetSlot() reports this value when the last returned
+//-- record is staged in RAM and has no physical slot yet (buffered mode).
+#define RING_FILE_SLOT_STAGED 0xFFFFFFFFu
 
 //-- Opaque handle.
 typedef struct ringFileHandle_s ringFileHandle_t;
@@ -200,7 +225,9 @@ typedef struct ringFileHandle_s ringFileHandle_t;
 //--    keySize bytes. Integer keys carry the raw little-endian field bytes
 //--    of exactly the type width. Byte-array keys carry exactly keySize
 //--    bytes. String keys are fixed-size char arrays and must contain a
-//--    null byte within keySize bytes.
+//--    null byte within keySize bytes. When a keyPositionMask is set,
+//--    bytes at insignificant positions may hold any value: comparisons
+//--    (duplicate check, lookup, update key match) ignore them.
 //--  * Records must be pointer-free and contain only fixed-width fields.
 //--    Payloads are stored as raw bytes: reopening a file requires the same
 //--    payload layout, ABI and little-endian byte order. Any layout change
@@ -279,6 +306,16 @@ esp_err_t ringFileIteratorNext(ringFileHandle_t *handle,
                                ringFileIterator_t *iterator, void *outRecord);
 esp_err_t ringFileIteratorPrevious(ringFileHandle_t *handle,
                                    ringFileIterator_t *iterator, void *outRecord);
+
+//-- Report the physical slot index (0 .. capacity) of the record the
+//-- cursor last returned, for diagnostics and test logging. Returns
+//-- RING_FILE_STORE_ERR_ITER_INVALIDATED when the cursor was invalidated
+//-- by a mutation, and RING_FILE_STORE_ERR_ITER_END semantics do not
+//-- apply (the slot of the last successful record is kept). A staged
+//-- record (buffered mode, not yet flushed) reports RING_FILE_SLOT_STAGED.
+esp_err_t ringFileIteratorGetSlot(ringFileHandle_t *handle,
+                                  const ringFileIterator_t *iterator,
+                                  uint32_t *outSlot);
 
 //-- Change capacity, preserving the relative order of retained records.
 //-- On shrink the newest records that fit are retained. newCapacity must

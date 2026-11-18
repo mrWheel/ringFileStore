@@ -17,4 +17,5 @@ cc -std=c11 -g -Wall -Wextra -Werror \
    host/test_ring_file_store.c \
    -o build/host/test_ring_file_store
 
-build/host/test_ring_file_store
+# argv[1]: testLog.md destination (repository root).
+build/host/test_ring_file_store ../../../testLog.md

@@ -25,13 +25,23 @@ state after reopening. Covered, per the project prompt:
   guarantees (no writes at all), multiple independent files;
 * wear accounting: one write + one sync per mutation, zero writes for
   unchanged updates, buffered coalescing and forced flush at the buffer
-  limit, clean close performs no write or sync.
+  limit, clean close performs no write or sync;
+* `moreRecords`: a capacity-10 ring filled and wrapped with 12 records,
+  with per-record key and physical slot number logged (via
+  `ringFileIteratorGetSlot`);
+* `keyPositionMask`: significant key positions — duplicate detection,
+  keyed lookup, update key match and mask persistence/reopen, plus
+  rejection of invalid masks.
 
 To run:
 
 ```sh
 ./run_tests.sh
 ```
+
+The run also writes `testLog.md` to the repository root: for every logged
+command the **Command** (with its data) and its **Result**, the ring
+dumps with key and slot number per record, and a per-test overview table.
 
 A future target-side Unity app (on-hardware LittleFS/FATFS runs) can be
 added under this directory; it is out of scope for this session because

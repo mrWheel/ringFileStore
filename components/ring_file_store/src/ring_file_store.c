@@ -1,5 +1,5 @@
 //--
-//-- File Version: [1] 18-11-2026 - 14:01
+//-- File Version: [2] 18-11-2026 - 19:05
 //--
 //-- ringFileStore - main ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -27,9 +27,9 @@ static const char *TAG = "ring_file_store";
 //-- ---------------------------------------------------------------------------
 //-- File format (little-endian, explicitly encoded, never a mapped struct)
 //--
-//-- [0 .. 64)                    header, one block, written by create,
+//-- [0 .. 96)                    header, one block, written by create,
 //--                              resize and clear only
-//-- [64 .. 64 + slotSize * (capacity + 1))   fixed-size slots
+//-- [96 .. 96 + slotSize * (capacity + 1))   fixed-size slots
 //--
 //-- The extra slot beyond capacity is the scratch area that keeps at least
 //-- one slot free for the in-flight commit copy, so no committed record is
@@ -38,12 +38,13 @@ static const char *TAG = "ring_file_store";
 //-- capacity members have a higher seq. File growth is lazy: a slot that
 //-- was never written reads back as empty (short read).
 //--
-//-- Header (64 bytes):
+//-- Header (96 bytes):
 //--   0  u32 magic 'RFS1'      4  u16 formatVersion   6  u16 headerSize
 //--   8  u64 generation        16 u32 schemaId        20 u32 schemaVersion
 //--  24  u32 recordSize        28 u32 capacity        32 u32 keyOffset
 //--  36  u32 keyType           40 u32 keySize         44 u32 flags
-//--  48  u64 epoch             56 u32 crc32 over [0,56)  60 u32 reserved
+//--  48  u64 epoch             56 u64 keyPositionMask 64 u64[3] reserved
+//--  88  u32 crc32 over [0,88) 92 u32 reserved
 //--
 //-- Slot header (20 bytes), followed by recordSize raw record bytes:
 //--   0  u32 slotMagic 'RFS2'  4  u64 seq            12 u32 rev
@@ -52,8 +53,8 @@ static const char *TAG = "ring_file_store";
 
 #define RFS_MAGIC 0x52465331u
 #define RFS_SLOT_MAGIC 0x52465332u
-#define RFS_FORMAT_VERSION 1u
-#define RFS_HEADER_SIZE 64u
+#define RFS_FORMAT_VERSION 2u
+#define RFS_HEADER_SIZE 96u
 #define RFS_SLOT_HDR_SIZE 20u
 
 #define RFS_MAX_RECORD_SIZE 4096u
@@ -274,6 +275,7 @@ struct ringFileHandle_s
   uint32_t keyOffset;
   uint32_t keyType;
   uint32_t keySize;
+  uint64_t keyMask;
   uint32_t slotSize;
 
   uint64_t nextSeq;
@@ -528,6 +530,26 @@ static uint16_t rfsKeyTypeWidth(ringFileKeyType_t type)
   }
 }
 
+//-- A cleared keyPositionMask means "all positions significant". A set
+//-- mask is limited to the first keySize byte positions, so keySize must
+//-- stay within 64 bits and no bit at or beyond keySize may be set.
+static bool rfsKeyMaskValid(uint64_t mask, uint16_t keySize)
+{
+  if (mask == 0)
+  {
+    return true;
+  }
+
+  if (keySize > 64)
+  {
+    return false;
+  }
+
+  uint64_t validBits = (keySize == 64) ? ~0ULL : ((1ULL << keySize) - 1u);
+
+  return (mask & ~validBits) == 0;
+}
+
 static esp_err_t rfsValidateKeyDescriptor(const ringFileKeyDescriptor_t *key,
                                           uint32_t recordSize)
 {
@@ -557,6 +579,11 @@ static esp_err_t rfsValidateKeyDescriptor(const ringFileKeyDescriptor_t *key,
     return ESP_ERR_INVALID_ARG;
   }
 
+  if (!rfsKeyMaskValid(key->keyPositionMask, key->keySize))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
   return ESP_OK;
 }
 
@@ -572,13 +599,36 @@ static bool rfsKeyBytesValid(const ringFileHandle_t *h, const uint8_t *key)
 
 static bool rfsKeyEqual(const ringFileHandle_t *h, const uint8_t *a, const uint8_t *b)
 {
-  if ((ringFileKeyType_t)h->keyType == RING_FILE_KEY_STRING)
+  bool isString = ((ringFileKeyType_t)h->keyType == RING_FILE_KEY_STRING);
+
+  if (h->keyMask == 0)
   {
-    //-- Bytes after the first terminator are ignored.
-    return strncmp((const char *)a, (const char *)b, h->keySize) == 0;
+    if (isString)
+    {
+      //-- Bytes after the first terminator are ignored.
+      return strncmp((const char *)a, (const char *)b, h->keySize) == 0;
+    }
+
+    return memcmp(a, b, h->keySize) == 0;
   }
 
-  return memcmp(a, b, h->keySize) == 0;
+  //-- Masked comparison: insignificant positions are ignored. For strings
+  //-- the comparison ends at the first terminator of either key, matching
+  //-- the unmasked strncmp behaviour.
+  for (uint32_t i = 0; i < h->keySize; i++)
+  {
+    if (isString && (a[i] == 0 || b[i] == 0))
+    {
+      return a[i] == b[i];
+    }
+
+    if (((h->keyMask >> i) & 1u) != 0 && a[i] != b[i])
+    {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 static void rfsExtractKey(const ringFileHandle_t *h, const uint8_t *record,
@@ -1125,7 +1175,8 @@ static void rfsEncodeHeader(const ringFileHandle_t *h, uint8_t *buf,
   rfsPutU32(buf + 40, h->keySize);
   rfsPutU32(buf + 44, 0);
   rfsPutU64(buf + 48, epoch);
-  rfsPutU32(buf + 56, rfsCrc32(buf, 56));
+  rfsPutU64(buf + 56, h->keyMask);
+  rfsPutU32(buf + 88, rfsCrc32(buf, 88));
 }
 
 static esp_err_t rfsDecodeHeader(const uint8_t *buf, int64_t fileLength,
@@ -1159,7 +1210,7 @@ static esp_err_t rfsDecodeHeader(const uint8_t *buf, int64_t fileLength,
     return RING_FILE_STORE_ERR_FORMAT;
   }
 
-  if (rfsGetU32(buf + 56) != rfsCrc32(buf, 56))
+  if (rfsGetU32(buf + 88) != rfsCrc32(buf, 88))
   {
     *issue = RING_FILE_META_BAD_CHECKSUM;
     return RING_FILE_STORE_ERR_CORRUPT;
@@ -1170,6 +1221,7 @@ static esp_err_t rfsDecodeHeader(const uint8_t *buf, int64_t fileLength,
   uint32_t keyOffset = rfsGetU32(buf + 32);
   uint32_t keyType = rfsGetU32(buf + 36);
   uint32_t keySize = rfsGetU32(buf + 40);
+  uint64_t keyMask = rfsGetU64(buf + 56);
 
   if (recordSize == 0 || recordSize > RFS_MAX_RECORD_SIZE || capacity == 0 ||
       capacity > RFS_MAX_CAPACITY)
@@ -1183,7 +1235,8 @@ static esp_err_t rfsDecodeHeader(const uint8_t *buf, int64_t fileLength,
   if (keyType < RING_FILE_KEY_S8 || keyType > RING_FILE_KEY_STRING ||
       (keyTypeWidth != 0 && keySize != keyTypeWidth) ||
       (keyTypeWidth == 0 && (keySize == 0 || keySize > RFS_MAX_KEY_SIZE)) ||
-      (uint64_t)keyOffset + keySize > recordSize)
+      (uint64_t)keyOffset + keySize > recordSize ||
+      !rfsKeyMaskValid(keyMask, (uint16_t)keySize))
   {
     *issue = RING_FILE_META_BAD_GEOMETRY;
     return RING_FILE_STORE_ERR_FORMAT;
@@ -1204,6 +1257,7 @@ static esp_err_t rfsDecodeHeader(const uint8_t *buf, int64_t fileLength,
   probe->keyOffset = keyOffset;
   probe->keyType = keyType;
   probe->keySize = keySize;
+  probe->keyMask = keyMask;
   probe->slotSize = slotSize;
   probe->generation = rfsGetU64(buf + 8);
   probe->epoch = rfsGetU64(buf + 48);
@@ -1392,6 +1446,7 @@ static esp_err_t rfsOpenDataFile(ringFileHandle_t *h)
     h->keyOffset = probe.keyOffset;
     h->keyType = probe.keyType;
     h->keySize = probe.keySize;
+    h->keyMask = probe.keyMask;
     h->slotSize = probe.slotSize;
 
     return ESP_OK;
@@ -1596,6 +1651,7 @@ esp_err_t ringFileCreate(const char *path, const ringFileConfig_t *config,
   h->keyOffset = config->key.keyOffset;
   h->keyType = (uint32_t)config->key.keyType;
   h->keySize = config->key.keySize;
+  h->keyMask = config->key.keyPositionMask;
   h->slotSize = RFS_SLOT_HDR_SIZE + config->recordSize;
   h->epoch = 0;
   h->generation = 0;
@@ -2329,6 +2385,7 @@ esp_err_t ringFileIteratorBegin(ringFileHandle_t *handle,
   {
     iterator->cursorSeq = member.seq;
     iterator->stamp = handle->mutationStamp;
+    iterator->slot = member.pending ? RING_FILE_SLOT_STAGED : (uint32_t)member.slot;
     iterator->begun = true;
   }
   else
@@ -2366,6 +2423,7 @@ static esp_err_t rfsIteratorStep(ringFileHandle_t *handle,
   if (err == ESP_OK)
   {
     iterator->cursorSeq = member.seq;
+    iterator->slot = member.pending ? RING_FILE_SLOT_STAGED : (uint32_t)member.slot;
   }
 
   RFS_EXIT(handle);
@@ -2394,6 +2452,28 @@ esp_err_t ringFileIteratorPrevious(ringFileHandle_t *handle,
   return rfsIteratorStep(handle, iterator, outRecord, false);
 }
 
+esp_err_t ringFileIteratorGetSlot(ringFileHandle_t *handle,
+                                  const ringFileIterator_t *iterator,
+                                  uint32_t *outSlot)
+{
+  if (handle == NULL || iterator == NULL || outSlot == NULL)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  RFS_ENTER(handle);
+
+  if (!iterator->begun || iterator->stamp != handle->mutationStamp)
+  {
+    RFS_EXIT(handle);
+    return RING_FILE_STORE_ERR_ITER_INVALIDATED;
+  }
+
+  *outSlot = iterator->slot;
+  RFS_EXIT(handle);
+  return ESP_OK;
+}
+
 esp_err_t ringFileGetInfo(ringFileHandle_t *handle, ringFileInfo_t *outInfo)
 {
   if (handle == NULL || outInfo == NULL)
@@ -2411,6 +2491,7 @@ esp_err_t ringFileGetInfo(ringFileHandle_t *handle, ringFileInfo_t *outInfo)
       (uint64_t)RFS_HEADER_SIZE + (uint64_t)rfsSlotCount(handle) * handle->slotSize;
   outInfo->pendingCount = handle->pendingCount;
   outInfo->dirty = handle->dirty || handle->pendingEpochChange;
+  outInfo->keyPositionMask = handle->keyMask;
   RFS_EXIT(handle);
   return ESP_OK;
 }

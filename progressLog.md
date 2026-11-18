@@ -1,7 +1,8 @@
 # Project log
 
 Format: DD-MM-YYYY - HH:MM — what was tried, result, errors/findings.
-See the repository README for the logging rules.
+See the repository README for the logging rules. All documentation in
+English.
 
 ## 18-11-2026
 
@@ -15,7 +16,7 @@ See the repository README for the logging rules.
   (capacity + 1) fixed slots of [20-byte slot header | record]; committed
   state derived from per-slot (seq, rev, CRC32); mutations commit exactly
   one slot image and never overwrite a committed slot in place; header only
-  written by create/resize/clear. Wrote public header (API, error enum,
+  written by create, resize and clear. Wrote public header (API, error enum,
   buffer contract) and component source.
 - 14:40 — Wrote host test harness: POSIX shims (esp_err/esp_log/FreeRTOS
   mutex) + failure-injection table over the internal file ops. First
@@ -73,94 +74,153 @@ See the repository README for the logging rules.
   suite: **573 checks, 0 failures**. `idf.py build` (esp32) OK, app
   0x3a5f0, 86% free. Cause of the *original* interrupted run still
   unknown (no log of that boot); next flash will show where it stops.
-- 15:11 — S3 bord (DevKitC-1-N32R8V, WROOM-2): boot abort
-  `quad_psram: PSRAM chip is not connected` / `Failed to init external RAM`.
-  Oorzaak: config ging uit van quad PSRAM + 4 MB flash; module is octal
-  (OPI) flash 32 MB + octal PSRAM 8 MB op 1.8 V. `sdkconfig.defaults.esp32s3`
-  + `sdkconfig` gezet op `ESPTOOLPY_OCT_FLASH`, `FLASHMODE_OPI`,
-  `FLASH_MODE_AUTO_DETECT=n`, `FLASHSIZE_32MB`, `SPIRAM_MODE_OCT`,
-  `SPIRAM_SPEED_80M`. Boot nu correct: octal PSRAM 8 MB + mxic OPI flash,
-  memtest OK. Twee struikelblokken onderweg: Finder-kopie
-  `managed_components/joltwallet__littlefs 2` weggezet (CMake weigerde),
-  component opnieuw opgehaald. Eerste run daarna: taak-watchdog abort
-  (IDLE0/CPU0) in de eerste `ringFileClose -> rfsReleaseLock -> unlink`
-  (LittleFS, backtraceanker `cache_utils.c:173` = wachten op CPU1 IPC vóór
-  cache-disable). RONDE 1: yields (`vTaskDelay`) tussen de flash-zware
-  demo-fases + `ESP_TASK_WDT_TIMEOUT_S=10`. Identieke trace -> niet opgelost;
-  de stage-1 hardware reset verklaart ook het telkens achterblijven van het
-  stale lock-bestand.
-- 15:35 — Instrumentatie + diagnose-pas: (a) testprogramma toont na IEDERE
-  stap de volledige ringinhoud van oud naar nieuw (`dumpRing()`, new->old via
-  iterator; aanroepen na create/open, elke add/update, hourly commit,
-  buffered staged/sync, resize 4->6, add 900, shrink->3, reopen, read-only);
-  (b) `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0/1=n` (sdkconfig +
-  defaults.esp32s3) zodat de idle-task watchdog-checks de hardware-reset-lus
-  niet meer triggers; watchdog zelf blijft aan (stage0 backtrace). Build en
-  flash/test op /dev/tty.usbserial-1430 door Claude (door gebruiker
-  geautoriseerd voor dit project/bord).
-- 16:40 — Volledige ringdumps na elke stap in het testprogramma actief
-  (`dumpRing()`); main.c FileVersion [5]. TWDT idle-checks uit
-  (CPU0/CPU1) om de reset-lus te doorbreken; main-task zelf subscribed
-  aan de TWDT en wordt na elke stap gefeed, zodat een hang een echte
-  backtrace van de vastlopende taak geeft. Build/flash/erase door Claude
-  op /dev/tty.usbserial-1430 (geautoriseerd).
-  Resultaten (seriële captures):
-  * De run komt nu verder dan de eerste `ringFileClose` (close/reopen
-  lukken) en blijft daarna ergens in een LittleFS-commit hangen; positie
-  verschuift per boot -> race, geen vaste deadlockplek.
-  * Backtrace (main-task, CPU0): spin in
+- 15:11 — S3 board (DevKitC-1-N32R8V, WROOM-2): boot abort
+  `quad_psram: PSRAM chip is not connected` / `Failed to init external
+  RAM`. Cause: the config assumed quad PSRAM + 4 MB flash; the module is
+  octal (OPI) 32 MB flash + 8 MB octal PSRAM at 1.8 V. Set
+  `sdkconfig.defaults.esp32s3` + `sdkconfig` to `ESPTOOLPY_OCT_FLASH`,
+  `FLASHMODE_OPI`, `FLASH_MODE_AUTO_DETECT=n`, `FLASHSIZE_32MB`,
+  `SPIRAM_MODE_OCT`, `SPIRAM_SPEED_80M`. Boot now correct: octal PSRAM
+  8 MB + mxic OPI flash, memtest OK. Two stumbling blocks on the way:
+  Finder copy `managed_components/joltwallet__littlefs 2` moved away
+  (CMake refused it), component re-fetched. First run after that: task
+  watchdog abort (IDLE0/CPU0) in the first
+  `ringFileClose -> rfsReleaseLock -> unlink` (LittleFS, backtrace anchor
+  `cache_utils.c:173` = waiting for CPU1 IPC before cache-disable). ROUND
+  1: yields (`vTaskDelay`) between the flash-heavy demo phases +
+  `ESP_TASK_WDT_TIMEOUT_S=10`. Identical trace → not resolved; the
+  stage-1 hardware reset also explains the repeatedly left-behind stale
+  lock file.
+- 15:35 — Instrumentation + diagnostic pass: (a) the test program now
+  shows the full ring contents from oldest to newest after EVERY step
+  (`dumpRing()`, new->old via iterator; called after create/open, every
+  add/update, hourly commit, buffered staged/sync, resize 4->6, add 900,
+  shrink->3, reopen, read-only); (b)
+  `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0/1=n` (sdkconfig +
+  defaults.esp32s3) so the idle-task watchdog checks no longer trigger
+  the hardware reset loop; the watchdog itself stays on (stage-0
+  backtrace). Build and flash/test on /dev/tty.usbserial-1430 by Claude
+  (authorized by the user for this project/board).
+- 16:40 — Full ring dumps after every test-program step active
+  (`dumpRing()`); main.c FileVersion [5]. TWDT idle-checks off
+  (CPU0/CPU1) to break the reset loop; the main task itself is subscribed
+  to the TWDT and fed after every step, so a hang produces a real
+  backtrace of the stuck task. Build/flash/erase by Claude on
+  /dev/tty.usbserial-1430 (authorized).
+  Results (serial captures):
+  * The run now gets past the first `ringFileClose` (close/reopen
+  succeed) and then hangs somewhere in a later LittleFS commit; the
+  position shifts per boot → race, no fixed deadlock location.
+  * Backtrace (main task, CPU0): spin in
   `spi_flash_disable_interrupts_caches_and_other_cpu()`
-  (cache_utils.c:175, wachten op `s_flash_op_can_start`) bereikt via
+  (cache_utils.c:175, waiting for `s_flash_op_can_start`) reached via
   `ringFileClose -> rfsReleaseLock -> unlink -> lfs_stat -> lfs_dir_fetch
-  -> esp_flash_read -> spi1_start`; CPU1 toont IDLE1 en de ipc1-taak
-  (esp_ipc_call_nonblocking) acked nooit. De eerdere "844 ms"-anomalie is
-  verklaard: de esp_timer-ISR is niet IRAM-safe, dus de log-timestamps
-  bevriezen op het moment van de hang; de TWDT-ISR (wel IRAM) blijft
-  afdrukken met de bevroren tijd.
-  * Experiment 1: `CONFIG_SPIRAM=n` -> zelfde hang op dezelfde plaats.
-  PSRAM/MSPI-delingshypothese vervallen.
-  * Experiment 2: `CONFIG_FREERTOS_UNICORE=y` -> geen hang maar een
-  crash: `LoadProhibited` in `heap_caps_free()` <- `free()` <-
+  -> esp_flash_read -> spi1_start`; CPU1 shows IDLE1 and the ipc1 task
+  (esp_ipc_call_nonblocking) never acked. The earlier "844 ms" anomaly is
+  explained: the esp_timer ISR is not IRAM-safe, so log timestamps freeze
+  at the moment of the hang; the TWDT ISR (which is IRAM) keeps printing
+  with the frozen time.
+  * Experiment 1: `CONFIG_SPIRAM=n` → same hang at the same place. The
+  PSRAM/MSPI-sharing hypothesis is dropped.
+  * Experiment 2: `CONFIG_FREERTOS_UNICORE=y` → no hang but a crash:
+  `LoadProhibited` in `heap_caps_free()` <- `free()` <-
   `esp_littlefs_free_fd()` (esp_littlefs.c:1751, `free(file)`) <-
   `vfs_littlefs_close` <- `close()` <- `rfsIoClose` in `ringFileClose`
-  (eerste close). EXCVADDR=0x2c. => onderliggende oorzaak is
-  HEAPCORRUPTIE (de CPU1/IPC-hang was een symptoom: corruptie raakte de
-  ipc1-besturing). Volgende stap: `CONFIG_HEAP_POISONING_COMPREHENSIVE=y`
-  + `heap_caps_check_integrity_all(true)` na elke demo-stap; PSRAM blijft
-  uit voor deze ronde (scan van de 8 MB PSRAM-heap duurt langer dan de
-  interrupt-WDT-toestond).
-- 16:40 (vervolg) — Heap-debugronde: `CONFIG_HEAP_POISONING_COMPREHENSIVE`
-  + integrity-check na elke stap (PSRAM kort uit, want het scannen van de
-  8 MB PSRAM-heap overschreed de interrupt-WDT). Crashpunten bleven
-  wandelen (littlefs fd-tabel, VFS-tabel tijdens ESP_LOGI) en de
-  heap-controle was net vóór de crash nog geslaagd => wild-writer, geen
-  klassiek heaplek. Verdachte: main-taak-stack van slechts 3584 bytes bij
-  de diepe aanroepketen (demo -> component -> littlefs -> ESP_LOG) en de
-  nieuwe per-stap-ringdumps.
-  TEST: `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192` + stack-end-watchpoint ->
-  run7: demo liep volledig uit tot "example finished", alle ringdumps
-  correct, validate header=1 badSlots=0 strays=0, één boot, geen resets.
-  => ROOT OORZAAK: stack-overflow main-taak; de eerdere "IPC/CPU1-hang"
-  en de willekeurige crashes waren symptomen van heapcorruptie door het
-  oversturende stackgebruik. Host-suite (573 checks) met ASan/UBSan: 0
-  fouten (component zelf is geheugendicht).
-  Herstel naar productieconfiguratie: PSRAM weer aan, dual-core weer aan,
-  heap-poisoning en stack-watchpoint weer uit, idle-task-WDT-checks weer
-  aan; main-stack 8192 blijft (oplossing) en is vastgelegd in
-  `sdkconfig.defaults.esp32s3`. Hierna: erase-flash + schone
-  acceptatierun (create-pad incl. demoRingOperations).
-- 17:14 — Acceptatietest geslaagd. Productieconfiguratie hersteld
-  (dual-core aan, octal PSRAM aan, heap-poisoning en stack-watchpoint uit,
-  idle-task-WDT-checks aan, main-stack 8192 als vaste oplossing in
-  `sdkconfig.defaults.esp32s3`). Na `erase-flash` (schone LittleFS) één
-  boot: create-pad volledig doorlopen (demoRingOperations met correcte
-  evict: `add 400` verdringt oudste 100; update 300 -> errors=7 behoudt
-  positie), daarna hourly logger, buffered staged/sync, resize 4->6,
-  add 900, shrink->3, validate (header=1 committed=3 badSlots=0 strays=0),
-  read-only open en unmount; laatste regel "example finished", geen
-  watchdog, geen crashes. Daarna nog labels van twee ringdumps gecorrigeerd
-  (evict zit bij add 400, niet bij add 50) en opnieuw gebouwd/geflasht:
-  ook die build draalt volledig uit. Host-suite blijft 573 checks / 0
-  failures (ook onder ASan/UBSan). README component: sectie
-  "Filesystem, locking and task context" aangevuld met de eis van >= 8 KB
-  taak-stack voor aanroepende taken.
+  (first close). EXCVADDR=0x2c. => Root cause is HEAP CORRUPTION (the
+  CPU1/IPC hang was a symptom: the corruption hit the ipc1 control
+  block). Next step: `CONFIG_HEAP_POISONING_COMPREHENSIVE=y` +
+  `heap_caps_check_integrity_all(true)` after every demo step; PSRAM
+  stays off for this round (scanning the 8 MB PSRAM heap takes longer
+  than the interrupt WDT allows).
+- 16:40 (continued) — Heap-debug round: `CONFIG_HEAP_POISONING_COMPREHENSIVE`
+  + integrity check after every step (PSRAM briefly off, because scanning
+  the 8 MB PSRAM heap exceeded the interrupt WDT). Crash locations kept
+  moving (littlefs fd table, VFS table during ESP_LOGI) and the heap
+  check had still passed just before the crash → wild writer, not a
+  classic heap leak. Suspect: the main task's 3584-byte stack with the
+  deep call chain (demo → component → littlefs → ESP_LOG) and the new
+  per-step ring dumps.
+  TEST: `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192` + stack end watchpoint →
+  run7: the demo ran completely to "example finished", all ring dumps
+  correct, validate header=1 badSlots=0 strays=0, one boot, no resets.
+  => ROOT CAUSE: main-task stack overflow; the earlier "IPC/CPU1 hang"
+  and the random crashes were symptoms of heap corruption caused by the
+  overrunning stack. Host suite (573 checks) under ASan/UBSan: 0 errors
+  (the component itself is memory-clean).
+  Restored production configuration: PSRAM back on, dual-core back on,
+  heap poisoning and stack watchpoint back off, idle-task WDT checks back
+  on; main stack stays 8192 (the fix), recorded in
+  `sdkconfig.defaults.esp32s3`. Next: erase-flash + clean acceptance run
+  (create path incl. demoRingOperations).
+- 17:14 — Acceptance test passed. Production configuration restored
+  (dual-core on, octal PSRAM on, heap poisoning and stack watchpoint off,
+  idle-task WDT checks on, main stack 8192 as the permanent fix in
+  `sdkconfig.defaults.esp32s3`). After `erase-flash` (clean LittleFS) one
+  boot: create path fully executed (demoRingOperations with correct
+  evict: `add 400` evicts oldest 100; update 300 → errors=7 preserves
+  position), then hourly logger, buffered staged/sync, resize 4->6, add
+  900, shrink->3, validate (header=1 committed=3 badSlots=0 strays=0),
+  read-only open and unmount; last line "example finished", no watchdog,
+  no crashes. Then corrected the labels of two ring dumps (the eviction
+  belongs to add 400, not add 50) and rebuilt/flashed: that build also
+  runs completely. Host suite stays 573 checks / 0 failures (also under
+  ASan/UBSan). Component README: section "Filesystem, locking and task
+  context" extended with the requirement of a >= 8 KB task stack for
+  calling tasks.
+- 19:05 — Feature round per developer feedback (all documentation in
+  English):
+  * **Key position mask**: `ringFileKeyDescriptor_t.keyPositionMask`
+    (uint64_t) selects the significant byte positions of the key; 0 = all
+    significant. Applied in every key comparison (duplicate check, keyed
+    read, update key match, upsert, iterator-by-key); persisted in the
+    file header. Header grew 64 → 96 bytes (keyPositionMask at 56, CRC
+    over [0,88)), format version 1 → 2; old files are rejected explicitly
+    (`BAD_FORMAT_VERSION`/`SHORT_FILE`), so the board was erased before
+    the acceptance run. Mask validation + persistence + string/mask
+    semantics documented in the public header and README.
+  * **Slot reporting**: `ringFileIteratorGetSlot()` returns the physical
+    slot of the last returned record (`RING_FILE_SLOT_STAGED` for a
+    staged record); `ringFileInfo_t.keyPositionMask` added. Example
+    `dumpRing()` lines now show `key=` and `slot=` per record;
+    `logRecord()` prints the key explicitly.
+  * **More records**: example ring capacity 4 → 10 (12 adds: fills the
+    ring, evicts 100 and 300; update of 400 preserves position) and new
+    host test `moreRecords` (capacity 10, 12 adds, key+slot dumps).
+  * **Key mask demo**: example `demoKeyMaskRing()` (second ring
+    `keymask.rfs`, mask 0xFC: byte positions 0-1 of the timestamp key
+    insignificant) + host test `keyPositionMask` (duplicate-by-mask,
+    lookup, update key match, mask survives reopen, invalid masks
+    rejected).
+  * **testLog.md**: the host suite now writes `testLog.md` (repository
+    root, path passed by `run_tests.sh`) recording every logged command
+    with its data and its result, ring dumps with key and slot per
+    record, a per-test overview table and the PASS/FAIL summary.
+  * Host suite: **633 checks, 0 failures**. `idf.py build` (esp32s3) OK,
+    app 0x394c0, 87% free.
+- 19:40 — Developer instruction: ALL documentation in English (this file
+  translated from Dutch; testLog.md generator rewritten in English).
+  Findings and fixes from the first hardware run:
+  * `esp_err_to_name()` prints a bare "ERROR" for every custom
+    `RING_FILE_STORE_ERR_*` code (IDF's generated lookup table does not
+    contain them). Added a local `rfsErrName()` helper in the example and
+    a full custom-code name table in the test shim, so serial output and
+    testLog.md show `DUPLICATE_KEY`, `KEY_NOT_FOUND`, etc.
+  * Key-mask demo bug (example, not component): the second add used
+    `base + 512`, which changes only byte 1 — an insignificant position —
+    so the add correctly returned DUPLICATE_KEY instead of appending.
+    Changed to `base + 65536` (byte 2 differs). The demo now calls
+    `ringFileClear()` at the start so every boot logs the identical
+    scenario.
+  * First clean-boot acceptance run (erase-flash, then esptool
+    `write-flash @flash_args --after no-reset` + RTS reset under a pyserial
+    capture; note: `erase-flash` erases the whole flash, so a full re-flash
+    is required afterwards): single boot to "example finished". Created
+    ring at capacity 10; add 650 fills it; add 700 evicts oldest 100; add
+    750 evicts oldest 300; `read 100 (evicted): KEY_NOT_FOUND`; update 400
+    (errors=7) keeps its position; hourly logger and buffered demo show
+    `key=` + `slot=` per dump line (staged record prints `slot=staged`);
+    validate header=1 committed=3 badSlots=0 strays=0; key-mask ring logs
+    `add key=1765000047 (only bytes 0-1 differ): DUPLICATE_KEY` and
+    `add key=1765065536 (byte 2 differs): ESP_OK`, dump lists key and
+    slot 0/1. Host suite stays 633 checks / 0 failures; testLog.md written
+    in English with named results, key/slot dumps and the summary table.

@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [7] 18-11-2026 - 17:06
+//-- FileVersion: [9] 18-11-2026 - 19:40
 //--
 //-- ringFileStore - Example application for the ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -13,7 +13,10 @@
 //-- Demonstrated: create, reopen, wraparound, lookup, edit (update-or-add
 //-- of the current hourly record), iteration in both directions, resize,
 //-- validation and information reporting, plus a buffered-mode variant of
-//-- the hourly logger showing the coalesced commit.
+//-- the hourly logger showing the coalesced commit. Every dump line shows
+//-- the record key and its physical slot number. A second ring demonstrates
+//-- a key position mask: only the significant byte positions of the
+//-- timestamp key take part in comparisons.
 
 #include <stdio.h>
 #include <string.h>
@@ -50,7 +53,7 @@ typedef struct
 
 #define SCHEMA_ID 0x4D455431u  //-- "MET1"
 #define SCHEMA_VERSION 1u
-#define RING_CAPACITY 4u
+#define RING_CAPACITY 10u
 
 static esp_err_t mountStorage(void)
 {
@@ -114,6 +117,49 @@ static void unmountStorage(void)
 #endif
 }
 
+//-- esp_err_to_name() prints a bare "ERROR" for any code outside the
+//-- generated IDF lookup table, which covers all custom
+//-- RING_FILE_STORE_ERR_* codes. Map them explicitly so the serial log
+//-- stays readable.
+static const char *rfsErrName(esp_err_t err)
+{
+  switch (err)
+  {
+    case RING_FILE_STORE_ERR_RING_EMPTY:
+      return "RING_EMPTY";
+    case RING_FILE_STORE_ERR_KEY_NOT_FOUND:
+      return "KEY_NOT_FOUND";
+    case RING_FILE_STORE_ERR_DUPLICATE_KEY:
+      return "DUPLICATE_KEY";
+    case RING_FILE_STORE_ERR_ITER_END:
+      return "ITER_END";
+    case RING_FILE_STORE_ERR_ITER_INVALIDATED:
+      return "ITER_INVALIDATED";
+    case RING_FILE_STORE_ERR_SCHEMA_MISMATCH:
+      return "SCHEMA_MISMATCH";
+    case RING_FILE_STORE_ERR_FORMAT:
+      return "FORMAT";
+    case RING_FILE_STORE_ERR_CORRUPT:
+      return "CORRUPT";
+    case RING_FILE_STORE_ERR_READONLY:
+      return "READONLY";
+    case RING_FILE_STORE_ERR_IO:
+      return "IO";
+    case RING_FILE_STORE_ERR_RECOVERY_REQUIRED:
+      return "RECOVERY_REQUIRED";
+    case RING_FILE_STORE_ERR_IO_FAULTED:
+      return "IO_FAULTED";
+    case RING_FILE_STORE_ERR_STORAGE_FULL:
+      return "STORAGE_FULL";
+    case RING_FILE_STORE_ERR_ALREADY_EXISTS:
+      return "ALREADY_EXISTS";
+    case RING_FILE_STORE_ERR_BUSY:
+      return "BUSY";
+    default:
+      return esp_err_to_name(err);
+  }
+}
+
 static void mkRecord(meterRecord_t *rec, uint64_t hour, uint32_t energy,
                      uint16_t errors)
 {
@@ -141,6 +187,9 @@ static ringFileConfig_t baseConfig(void)
   cfg.key.keyOffset = (uint32_t)offsetof(meterRecord_t, timestamp);
   cfg.key.keyType = RING_FILE_KEY_U64;
   cfg.key.keySize = (uint16_t)sizeof(uint64_t);
+  //-- 0: all byte positions of the key are significant. demoKeyMaskRing()
+  //-- below shows a masked variant of the same timestamp key.
+  cfg.key.keyPositionMask = 0;
   cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
   return cfg;
 }
@@ -159,7 +208,31 @@ static ringFileOpenConfig_t openConfig(bool readOnly)
 
 static void logRecord(const char *label, const meterRecord_t *rec)
 {
-  ESP_LOGI(TAG, "%s: hour=%llu energy=%lu errors=%u", label,
+  ESP_LOGI(TAG, "%s: key=%llu energy=%lu errors=%u", label,
+           (unsigned long long)rec->timestamp, (unsigned long)rec->energyWh,
+           (unsigned)rec->errorCount);
+}
+
+//-- One dump line: label, physical slot number and the record key. A
+//-- staged record (buffered mode, not yet on storage) shows slot=staged.
+static void logRecordSlot(const char *label, ringFileHandle_t *handle,
+                          ringFileIterator_t *iter, const meterRecord_t *rec)
+{
+  uint32_t slot = RING_FILE_SLOT_STAGED;
+  char line[48];
+
+  ringFileIteratorGetSlot(handle, iter, &slot);
+
+  if (slot == RING_FILE_SLOT_STAGED)
+  {
+    snprintf(line, sizeof(line), "%s slot=staged", label);
+  }
+  else
+  {
+    snprintf(line, sizeof(line), "%s slot=%lu", label, (unsigned long)slot);
+  }
+
+  ESP_LOGI(TAG, "%s key=%llu energy=%lu errors=%u", line,
            (unsigned long long)rec->timestamp, (unsigned long)rec->energyWh,
            (unsigned)rec->errorCount);
 }
@@ -185,11 +258,11 @@ static void dumpRing(ringFileHandle_t *handle, const char *step)
 
   if (ringFileIteratorBegin(handle, &iter, RING_FILE_ITER_OLDEST, NULL, &rec) == ESP_OK)
   {
-    logRecord("  [oldest>", &rec);
+    logRecordSlot("  [oldest>", handle, &iter, &rec);
 
     while (ringFileIteratorNext(handle, &iter, &rec) == ESP_OK)
     {
-      logRecord("  [       >", &rec);
+      logRecordSlot("  [       >", handle, &iter, &rec);
     }
   }
   else
@@ -233,8 +306,9 @@ static void demoRingOperations(ringFileHandle_t *handle)
 {
   meterRecord_t rec, out;
 
-  //-- Wraparound with out-of-order keys. Capacity 4: insert 100, 300, 200
-  //-- then 50, 400 so that 100 and 300 are evicted.
+  //-- Wraparound with out-of-order keys on a capacity 10 ring: insert
+  //-- 100, 300, 200, 50, 400 then 450..650 (fills the ring) and 700, 750
+  //-- which evict exactly the two oldest (100 and 300).
   mkRecord(&rec, 100, 1000, 0);
   ESP_ERROR_CHECK(ringFileAdd(handle, &rec));
   dumpRing(handle, "add 100");
@@ -246,10 +320,35 @@ static void demoRingOperations(ringFileHandle_t *handle)
   dumpRing(handle, "add 200");
   mkRecord(&rec, 50, 500, 0);
   ESP_ERROR_CHECK(ringFileAdd(handle, &rec));
-  dumpRing(handle, "add 50 (ring now full)");
+  dumpRing(handle, "add 50");
   mkRecord(&rec, 400, 4000, 2);
   ESP_ERROR_CHECK(ringFileAdd(handle, &rec));
-  dumpRing(handle, "add 400 (evicts oldest 100)");
+  dumpRing(handle, "add 400");
+
+  static const uint64_t moreKeys[] = {450, 500, 550, 600, 650};
+
+  for (size_t i = 0; i < sizeof(moreKeys) / sizeof(moreKeys[0]); i++)
+  {
+    mkRecord(&rec, moreKeys[i], (uint32_t)(moreKeys[i] * 10), 0);
+    ESP_ERROR_CHECK(ringFileAdd(handle, &rec));
+
+    char step[48];
+    snprintf(step, sizeof(step), "add %llu", (unsigned long long)moreKeys[i]);
+
+    if (moreKeys[i] == 650)
+    {
+      strncat(step, " (ring now full)", sizeof(step) - strlen(step) - 1);
+    }
+
+    dumpRing(handle, step);
+  }
+
+  mkRecord(&rec, 700, 7000, 0);
+  ESP_ERROR_CHECK(ringFileAdd(handle, &rec));
+  dumpRing(handle, "add 700 (evicts oldest 100)");
+  mkRecord(&rec, 750, 7500, 0);
+  ESP_ERROR_CHECK(ringFileAdd(handle, &rec));
+  dumpRing(handle, "add 750 (evicts oldest 300)");
 
   //-- Yield for the idle task (task watchdog) after the burst of adds.
   esp_task_wdt_reset();
@@ -267,13 +366,17 @@ static void demoRingOperations(ringFileHandle_t *handle)
   logRecord("read 200", &out);
   key = 100;
   ESP_LOGI(TAG, "read 100 (evicted): %s",
-           esp_err_to_name(ringFileReadByKey(handle, &key, &out)));
+           rfsErrName(ringFileReadByKey(handle, &key, &out)));
+  key = 700;
+  ESP_ERROR_CHECK(ringFileReadByKey(handle, &key, &out));
+  logRecord("read 700", &out);
 
-  //-- Edit that preserves the insertion position.
-  uint64_t hour = 300;
-  mkRecord(&rec, 300, 3000, 7);
+  //-- Edit that preserves the insertion position: 400 keeps its place
+  //-- between 50 and 450 in the dumps below.
+  uint64_t hour = 400;
+  mkRecord(&rec, 400, 4000, 7);
   ESP_ERROR_CHECK(ringFileUpdateByKey(handle, &hour, &rec));
-  dumpRing(handle, "update 300");
+  dumpRing(handle, "update 400 (errors=7, position preserved)");
 
   demoIteration(handle);
 }
@@ -373,9 +476,9 @@ static void demoResizeAndValidate(const char *path)
   ringFileOpenConfig_t ocfg = openConfig(false);
   ESP_ERROR_CHECK(ringFileOpen(path, &ocfg, &handle));
 
-  ESP_LOGI(TAG, "-- resize capacity %u -> 6", (unsigned)RING_CAPACITY);
-  ESP_ERROR_CHECK(ringFileResize(handle, 6));
-  dumpRing(handle, "resize 4 -> 6");
+  ESP_LOGI(TAG, "-- resize capacity %u -> 14", (unsigned)RING_CAPACITY);
+  ESP_ERROR_CHECK(ringFileResize(handle, 14));
+  dumpRing(handle, "resize 10 -> 14");
   meterRecord_t rec;
   mkRecord(&rec, 900, 9000, 0);
   ESP_ERROR_CHECK(ringFileAdd(handle, &rec));
@@ -383,7 +486,7 @@ static void demoResizeAndValidate(const char *path)
 
   ESP_LOGI(TAG, "-- shrink back to 3 (newest retained)");
   ESP_ERROR_CHECK(ringFileResize(handle, 3));
-  dumpRing(handle, "shrink 6 -> 3");
+  dumpRing(handle, "shrink 14 -> 3");
   demoIteration(handle);
   ringFileClose(handle);
 
@@ -392,6 +495,84 @@ static void demoResizeAndValidate(const char *path)
   ESP_LOGI(TAG, "validate: header=%d committed=%lu badSlots=%lu strays=%d",
            (int)validation.headerValid, (unsigned long)validation.committedCount,
            (unsigned long)validation.badSlotCount, (int)validation.strayResizeFiles);
+}
+
+//-- Ring whose u64 timestamp key uses a key position mask: only the byte
+//-- positions whose mask bit is set take part in key comparisons. With
+//-- mask 0xFC the low bytes 0 and 1 (the seconds bits below 2^16) are
+//-- insignificant, so samples that differ only there address the same
+//-- record; byte 2 and above still decide key equality. The mask is
+//-- stored in the file header and reported by ringFileGetInfo().
+static void demoKeyMaskRing(void)
+{
+  char path[128];
+  snprintf(path, sizeof(path), "%s/keymask.rfs", CONFIG_EXAMPLE_MOUNT_POINT);
+
+  if (ringFileBreakStaleLock(path) == ESP_OK)
+  {
+    ESP_LOGW(TAG, "cleared stale lock (keymask ring) from an interrupted run");
+  }
+
+  ringFileConfig_t cfg = baseConfig();
+  cfg.maxRecords = 4;
+  cfg.key.keyPositionMask = 0x00000000000000FCULL;
+
+  ringFileHandle_t *handle = NULL;
+  esp_err_t err = ringFileCreate(path, &cfg, &handle);
+
+  if (err == RING_FILE_STORE_ERR_ALREADY_EXISTS)
+  {
+    ringFileOpenConfig_t ocfg = openConfig(false);
+    ESP_ERROR_CHECK(ringFileOpen(path, &ocfg, &handle));
+  }
+  else
+  {
+    ESP_ERROR_CHECK(err);
+  }
+
+  ringFileInfo_t info;
+  ESP_ERROR_CHECK(ringFileGetInfo(handle, &info));
+  ESP_LOGI(TAG, "key mask ring: mask=0x%016llx (byte positions 2-7 "
+           "significant, 0-1 ignored)",
+           (unsigned long long)info.keyPositionMask);
+
+  meterRecord_t rec;
+  uint64_t base = 1765000000ULL;
+
+  //-- Start from a known-empty ring so every boot logs the same scenario.
+  ESP_ERROR_CHECK(ringFileClear(handle));
+
+  mkRecord(&rec, base, 1000, 0);
+  err = ringFileAdd(handle, &rec);
+  ESP_LOGI(TAG, "  add key=%llu: %s", (unsigned long long)base,
+           rfsErrName(err));
+
+  uint64_t sameKey = base + 47;
+  mkRecord(&rec, sameKey, 1047, 0);
+  err = ringFileAdd(handle, &rec);
+  ESP_LOGI(TAG, "  add key=%llu (only bytes 0-1 differ): %s",
+           (unsigned long long)sameKey, rfsErrName(err));
+
+  uint64_t nextKey = base + 65536;
+  mkRecord(&rec, nextKey, 66536, 0);
+  err = ringFileAdd(handle, &rec);
+  ESP_LOGI(TAG, "  add key=%llu (byte 2 differs): %s",
+           (unsigned long long)nextKey, rfsErrName(err));
+
+  meterRecord_t out;
+  uint64_t probeKey = base + 9;
+  err = ringFileReadByKey(handle, &probeKey, &out);
+  ESP_LOGI(TAG, "  read key=%llu (byte 0 ignored): %s",
+           (unsigned long long)probeKey, rfsErrName(err));
+
+  if (err == ESP_OK)
+  {
+    logRecord("  read result", &out);
+  }
+
+  dumpRing(handle, "key mask scenario");
+  esp_task_wdt_reset();
+  ringFileClose(handle);
 }
 
 void app_main(void)
@@ -472,6 +653,9 @@ void app_main(void)
   esp_task_wdt_reset();
   vTaskDelay(pdMS_TO_TICKS(10));
   demoResizeAndValidate(path);
+  esp_task_wdt_reset();
+  vTaskDelay(pdMS_TO_TICKS(10));
+  demoKeyMaskRing();
   esp_task_wdt_reset();
   vTaskDelay(pdMS_TO_TICKS(10));
 
