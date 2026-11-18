@@ -1,0 +1,11 @@
+version: "0.1.0-dev.1"
+description: "Persistent fixed-capacity ring files for ESP-IDF"
+targets:
+  - esp32
+  - esp32s3
+dependencies:
+  idf: ">=6.0.2,<6.1"
+files:
+  exclude:
+    - "test/**/*"
+    - "dist/**/*"

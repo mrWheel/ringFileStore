@@ -1,0 +1,62 @@
+menu "Ring file store example"
+
+    choice EXAMPLE_BACKEND
+        prompt "Storage backend"
+        default EXAMPLE_BACKEND_LITTLEFS
+
+        config EXAMPLE_BACKEND_LITTLEFS
+            bool "LittleFS on internal flash (partition 'storage')"
+
+        config EXAMPLE_BACKEND_SD
+            bool "SD card with FATFS"
+    endchoice
+
+    config EXAMPLE_MOUNT_POINT
+        string "Mount point"
+        default "/rfs" if EXAMPLE_BACKEND_LITTLEFS
+        default "/sdcard" if EXAMPLE_BACKEND_SD
+
+    config EXAMPLE_RING_FILE
+        string "Ring file name inside the mount point"
+        default "meter.rfs"
+
+    menu "SD card pins (ESP32-WROVER)"
+        depends on EXAMPLE_BACKEND_SD
+
+        config EXAMPLE_SD_CLK
+            int "CLK GPIO"
+            default 14 if IDF_TARGET_ESP32
+            default 12
+
+        config EXAMPLE_SD_CMD
+            int "CMD GPIO"
+            default 15 if IDF_TARGET_ESP32
+            default 11
+
+        config EXAMPLE_SD_D0
+            int "D0 GPIO"
+            default 2 if IDF_TARGET_ESP32
+            default 13
+
+        config EXAMPLE_SD_D1
+            int "D1 GPIO (negative for 1-bit mode)"
+            default 4 if IDF_TARGET_ESP32
+            default 14
+
+        config EXAMPLE_SD_D2
+            int "D2 GPIO (negative for 1-bit mode)"
+            default 12 if IDF_TARGET_ESP32
+            default 9
+
+        config EXAMPLE_SD_D3
+            int "D3 GPIO (negative for 1-bit mode)"
+            default 13 if IDF_TARGET_ESP32
+            default 10
+
+        config EXAMPLE_SD_BUS_WIDTH
+            int "Bus width (1 or 4)"
+            default 4
+            range 1 4
+    endmenu
+
+endmenu

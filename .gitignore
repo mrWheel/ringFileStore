@@ -1,0 +1,10 @@
+/build/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+/components/ring_file_store/dist/
+/components/ring_file_store/test/build/
+.DS_Store
+.claude/
+.venv/
+.venv-1/

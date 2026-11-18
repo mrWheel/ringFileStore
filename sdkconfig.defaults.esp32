@@ -1,0 +1,5 @@
+# Applied on top of sdkconfig.defaults when the target is esp32
+# (ESP32-WROVER). PSRAM is enabled for the module; the component itself
+# only needs a few hundred bytes plus bounded scratch per handle, so PSRAM
+# is convenience, not a requirement.
+CONFIG_SPIRAM=y

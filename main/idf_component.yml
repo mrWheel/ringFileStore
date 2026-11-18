@@ -1,0 +1,8 @@
+## Managed component dependencies for the example application.
+## The ring_file_store component itself lives in ../components and needs no
+## dependency entry; keep filesystem configuration in the application only.
+license: "GPL-3.0-or-later"
+
+dependencies:
+  idf: ">=6.0.2,<6.1"
+  joltwallet/littlefs: "^1.18"

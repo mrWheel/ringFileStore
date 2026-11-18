@@ -1,0 +1,27 @@
+# Applied on top of sdkconfig.defaults when the target is esp32s3
+# (ESP32-S3-DevKitC-1 v1.1 with ESP32-S3-WROOM-2-N32R8V:
+#  32 MB octal (OPI) flash + 8 MB octal PSRAM, both 1.8 V).
+# The octal flash and octal PSRAM settings below must match the module,
+# otherwise boot aborts with "PSRAM chip is not connected" followed by
+# "Failed to init external RAM".
+CONFIG_ESPTOOLPY_OCT_FLASH=y
+CONFIG_ESPTOOLPY_FLASHMODE_OPI=y
+# Flash type is known (octal), so skip the quad/octal auto-detection.
+CONFIG_ESPTOOLPY_FLASH_MODE_AUTO_DETECT=n
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+# PSRAM is enabled for the module; the component itself only needs a few
+# hundred bytes plus bounded scratch per handle, so PSRAM is convenience,
+# not a requirement.
+# The example runs its whole demonstration from app_main: the ring calls,
+# the LittleFS layer and the ESP_LOG logging nest deeply, and the default
+# 3584-byte main-task stack overflowed (observed as random heap
+# corruption: crashes in free()/VFS and a stall in the flash IPC
+# handshake). 8 KB gives the demonstration comfortable headroom.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# LittleFS metadata commits run with the flash cache disabled, which keeps
+# the idle task from feeding the task watchdog; give the demo extra margin.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
