@@ -14,6 +14,7 @@ cc -std=c11 -g -Wall -Wextra -Werror \
    -I host/shim \
    host/shim/shim.c \
    ../src/ring_file_store.c \
+   ../src/rfs_time.c \
    host/test_ring_file_store.c \
    -o build/host/test_ring_file_store
 

@@ -1,6 +1,6 @@
 # ringFileStore — test log (host suite)
 
-Generated: 18-11-2026 - 21:03 — host tests with POSIX shims and failure-injection.
+Generated: 19-11-2026 - 10:01 — host tests with POSIX shims and failure-injection.
 
 Per line: **Command** (with data) and its **Result**; ring dumps show the key and the physical slot number per record.
 
@@ -274,6 +274,90 @@ Per line: **Command** (with data) and its **Result**; ring dumps show the key an
 - **Test result:** 17 checks, 0 new failures
 | keyPositionMask | 17 | 0 |
 
+## Test: timeHelpers
+- **Command:** ringFileTimeStampStringToUnix("20000101000000") = 946684800
+  **Result:** ESP_OK
+- **Command:** ringFileTimeStampStringToUnix("20240229000000") leap day = 1709164800
+  **Result:** ESP_OK
+- **Command:** "20261023123378": second 78 rejected
+  **Result:** ESP_ERR_INVALID_ARG
+- **Command:** "20230229000000": 2023 is not a leap year
+  **Result:** ESP_ERR_INVALID_ARG
+- **Command:** "21000101000000": century 21 rejected
+  **Result:** ESP_ERR_INVALID_ARG
+- **Command:** ringFileUnixToTimeStampString(946684799): before 2000 rejected
+  **Result:** ESP_ERR_INVALID_ARG
+- **Command:** round-trip unix -> "20261023123300"
+  **Result:** ESP_OK
+- **Command:** week buckets: Sunday 2026-01-04 -> 2922, Monday 2026-01-05 -> 2923 (Monday starts the bucket)
+  **Result:** ESP_OK
+- **Command:** month bucket 2026-10 = (2026-1)*12+10 = 24310
+  **Result:** ESP_OK
+- **Command:** ringFileUnixToIsoWeek(2025-12-29) = 2026-W01
+  **Result:** ESP_OK
+- **Test result:** 54 checks, 0 new failures
+| timeHelpers | 54 | 0 |
+
+## Test: timeBucketRing
+- **Command:** ringFileCreate(TIMEBUCKET, HOUR, capacity=3, timestampOffset=0)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(hour 10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(hour 11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(hour 10 again at 10:59:59): same bucket overwritten
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(hour 09: not newer -> refused, nothing stored
+  **Result:** UNKNOWN
+- **Command:** ringFileUpsert(hour 10 at 10:00:00): active bucket updated with any timestamp
+  **Result:** ESP_OK
+- **Command:** ringFileUpsert(hour 09 as new bucket): not newer -> refused
+  **Result:** UNKNOWN
+- **Command:** ringFileEdit(hour 12): newer bucket appended
+  **Result:** ESP_OK
+- **Command:** ringFileEdit(hour 09): outside retained window -> rejected
+  **Result:** UNKNOWN
+- **Command:** ringFileEdit(hour 10): active bucket updated
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(hour 13): oldest bucket (hour 10) evicted
+  **Result:** ESP_OK
+- **Command:** iterator: bucket order, logical slot = bucketId % capacity
+  **Result:** ESP_OK
+- **Command:** ringFileIteratorBegin(KEY, bucketId of hour 12)
+  **Result:** ESP_OK
+- **Command:** ring dump after "TIMEBUCKET scenario (adds, overwrite, edit, eviction)" (count=3 capacity=3, oldest → newest)
+  - slot 2 key=1792753200 energyWh=110 errorCount=0
+  - slot 0 key=1792756800 energyWh=120 errorCount=0
+  - slot 1 key=1792760400 energyWh=130 errorCount=0
+- **Command:** reopen expecting DAY granularity -> schema mismatch
+  **Result:** RING_FILE_STORE_ERR_SCHEMA_MISMATCH
+- **Command:** ringFileResize(2): newest buckets (12, 13) retained
+  **Result:** ESP_OK
+- **Command:** ringFileEdit on INSERTION ring -> INVALID_STATE
+  **Result:** ESP_ERR_INVALID_STATE
+- **Command:** create TIMEBUCKET with timestampOffset+8 > recordSize -> rejected
+  **Result:** ESP_ERR_INVALID_ARG
+- **Command:** create TIMEBUCKET with invalid granularity -> rejected
+  **Result:** ESP_ERR_INVALID_ARG
+- **Test result:** 79 checks, 0 new failures
+| timeBucketRing | 79 | 0 |
+
+## Test: timeBucketBufferedAndV2
+- **Command:** ringFileCreate(TIMEBUCKET, DAY, buffered maxPending=4)
+  **Result:** ESP_OK
+- **Command:** buffered: staged same-day overwrite visible, slot staged
+  **Result:** ESP_OK
+- **Command:** after sync: logical slot = bucketId % capacity = 0
+  **Result:** ESP_OK
+- **Command:** reopen buffered DAY ring: two committed day records
+  **Result:** ESP_OK
+- **Command:** header patched: formatVersion 3 -> 2, CRC recomputed
+  **Result:** patched
+- **Command:** v2 file: insertion semantics kept (out-of-order key accepted, oldest/newest by seq)
+  **Result:** ESP_OK
+- **Test result:** 35 checks, 0 new failures
+| timeBucketBufferedAndV2 | 35 | 0 |
+
 ## Summary
 
-**PASS**: 633 checks, 0 failures.
+**PASS**: 801 checks, 0 failures.

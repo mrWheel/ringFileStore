@@ -1,3 +1,10 @@
+```
+FileVersion: [1] 19-11-2026 - 09:06
+
+ringFileStore - host test suite README.
+Copyright (C) 2026 Willem Aandewiel (mrWheel)
+```
+
 # Component tests
 
 `run_tests.sh` compiles the component sources (`../src`) against the small
@@ -31,7 +38,19 @@ state after reopening. Covered, per the project prompt:
   `ringFileIteratorGetSlot`);
 * `keyPositionMask`: significant key positions — duplicate detection,
   keyed lookup, update key match and mask persistence/reopen, plus
-  rejection of invalid masks.
+  rejection of invalid masks;
+* time helpers: `"EEYYMMDDHHMMSS"` ↔ unix seconds (known value
+  2000-01-01 → 946684800, leap-year acceptance 2024-02-29 versus
+  rejection 2023-02-29, invalid digits/seconds/century), bucket
+  boundaries around the Monday-aligned week (Sunday versus Monday
+  timestamps) and ISO week numbering (2025-12-29 → 2026-W01);
+* TIMEBUCKET addressing: `..._ERR_NOT_NEWER` rejection on add/upsert,
+  same-bucket overwrite, `ringFileEdit` backfill inside and
+  `..._ERR_BUCKET_OUT_OF_RANGE` outside the retained window, bucket-ordered
+  oldest/newest/iteration/eviction/resize retention, logical
+  `bucketId % capacity` slot reporting, addressing/granularity/offset
+  schema-mismatch checks and format-version-2 header compatibility
+  (a v2 file still opens with insertion semantics).
 
 To run:
 

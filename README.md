@@ -1,5 +1,5 @@
 ```
-FileVersion: [1] 18-11-2026 - 22:35
+FileVersion: [2] 19-11-2026 - 09:06
 
 ringFileStore - repository README: project overview, usage and API documentation.
 Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -36,7 +36,9 @@ The example mounts the LittleFS partition `storage` (default) or an SD
 card (menuconfig → *Ring file store example* → *Storage backend*) and runs:
 create, reopen, wraparound with out-of-order keys, keyed lookup, edit
 (hourly update-or-add), iteration in both directions, resize, validation,
-buffered-mode staging and a read-only handle.
+buffered-mode staging, a read-only handle and a **timestamp ring file**
+(TIMEBUCKET addressing: component-derived hour/day/week/month buckets from
+a `uint64_t timeStamp` field, DSMRlogger32-style).
 
 Flash manually (uploads are handled by the developer):
 
@@ -73,7 +75,11 @@ invalidation, schema mismatch, reopen, corruption detection, resizing
 with pending buffered data, volume-full handling, write/sync counting
 (unchanged updates never write; buffered edits coalesce), interrupted
 mutations/renames leaving a complete previous-or-new state and stale-lock
-takeover after an interrupted run.
+takeover after an interrupted run, timestamp helpers (string↔unix,
+leap-year and boundary validation, Monday-aligned week and ISO week
+numbers) and TIMEBUCKET integration (not-newer rejection, same-bucket
+overwrite, backfill window, bucket-ordered iteration and eviction,
+logical `bucketId % capacity` slot, format-version-2 compatibility).
 
 Hardware: the LittleFS backend is exercised by the example build only;
 no backend was tested on physical hardware in this session (uploads are
@@ -1139,6 +1145,117 @@ esp_err_t err = ringFileBreakStaleLock(MONTH_PATH);
 *Expected result:* `ESP_ERR_NOT_FOUND` — the previous session released
 its lock at `ringFileClose()`, so there is nothing to break.
 
+### Timestamp ring files (TIMEBUCKET addressing)
+
+Time-series files can let the component derive the key from a
+`uint64_t timeStamp` field (unix seconds of the local wall clock treated
+as if UTC, DSMRlogger32-compatible) instead of a caller-chosen key. The
+granularity is fixed at create time; many timestamps map to the same
+**bucketId**, and they all address the same record.
+
+```c
+typedef struct
+{
+  uint64_t timeStamp;   //-- key is derived from this field
+  uint32_t energyWh;
+  uint16_t errorCount;
+  uint16_t pad;
+} hourRecord_t;
+
+ringFileConfig_t cfg = {0};
+cfg.maxRecords = 24;                        //-- 24 hourly buckets
+cfg.schemaId = 0x484F5531;
+cfg.schemaVersion = 1;
+cfg.recordSize = sizeof(hourRecord_t);
+cfg.addressing = RING_FILE_ADDRESSING_TIMEBUCKET;
+cfg.granularity = RING_FILE_GRANULARITY_HOUR;   //-- DAY, WEEK or MONTH
+cfg.timestampOffset = offsetof(hourRecord_t, timeStamp);
+//-- cfg.key is ignored: the key becomes the computed bucketId.
+
+ringFileHandle_t *hourly = NULL;
+ESP_ERROR_CHECK(ringFileCreate("/storage/hourly.rfs", &cfg, &hourly));
+```
+
+`ringFileOpen()` must repeat `expectedAddressing`,
+`expectedGranularity` and `expectedTimestampOffset` or the stored schema
+is rejected with `RING_FILE_STORE_ERR_SCHEMA_MISMATCH`. Order, eviction
+and resize retention follow **bucketId**, not insertion seq.
+
+**Example — the hourly logger pattern:**
+
+```c
+uint64_t ts;
+ESP_ERROR_CHECK(ringFileTimeStampStringToUnix("20261023141500", &ts));
+
+hourRecord_t rec = {0};
+rec.timeStamp = ts;
+rec.energyWh = 5432;
+
+//-- New hour: appends. Same hour again: overwrites (same bucket).
+ESP_ERROR_CHECK(ringFileUpsert(hourly, &rec));
+
+//-- Clock rewind or gap fill through add() is refused:
+rec.timeStamp = ts - 3600;                  //-- previous hour
+esp_err_t err = ringFileAdd(hourly, &rec);  //-- ..._ERR_NOT_NEWER
+
+//-- Backfill that previous hour explicitly (lost measurement):
+ESP_ERROR_CHECK(ringFileEdit(hourly, &rec));
+
+ringFileIterator_t iter;
+memset(&iter, 0, sizeof(iter));
+ESP_ERROR_CHECK(ringFileIteratorBegin(hourly, &iter, RING_FILE_ITER_NEWEST,
+                                      NULL, &rec));
+uint32_t slot;
+ESP_ERROR_CHECK(ringFileIteratorGetSlot(hourly, &iter, &slot));  //-- bucketId % 24
+```
+
+Granularity → bucketId: HOUR `ts / 3600`; DAY `ts / 86400`; WEEK
+`(ts + 259200) / 604800` (boundary **Monday 00:00**, ISO-8601); MONTH
+`(EEYY − 1) × 12 + MM` (DSMRlogger32 formula, 2026-10 → 24310).
+
+### ringFileEdit
+
+```c
+esp_err_t ringFileEdit(ringFileHandle_t *handle, const void *record);
+```
+
+TIMEBUCKET mode only (otherwise `ESP_ERR_INVALID_STATE`): backfill/edit
+when measurements for one or more buckets were lost. Updates the bucket
+when active (any `timeStamp`, unlike `ringFileAdd`); otherwise inserts it
+when inside the retained window
+`[newestBucket − capacity + 1, newestBucket]` — an empty ring accepts any
+bucket. Outside the window: `RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE`,
+nothing changes. At capacity the insert evicts exactly the oldest bucket.
+
+### ringFileTimeStampStringToUnix / ringFileUnixToTimeStampString
+
+```c
+esp_err_t ringFileTimeStampStringToUnix(const char *timeStamp, uint64_t *outUnixSeconds);
+esp_err_t ringFileUnixToTimeStampString(uint64_t unixSeconds, char outTimeStamp[15]);
+```
+
+Convert between unix seconds and the 14-digit `"EEYYMMDDHHMMSS"` string
+(century fixed `20`, years 2000–2099). Parse validation: exactly 14
+digits, month 01–12, day valid for the month including leap years, hour
+00–23, minute/second 00–59; violations are `ESP_ERR_INVALID_ARG`.
+`"20000101000000"` ↔ `946684800`. `outTimeStamp` receives 14 digits plus
+a NUL; values outside 2000–2099 are `ESP_ERR_INVALID_ARG`.
+
+### ringFileUnixToBucketId / ringFileUnixToIsoWeek
+
+```c
+esp_err_t ringFileUnixToBucketId(uint64_t unixSeconds, ringFileGranularity_t granularity,
+                                 uint64_t *outBucketId);
+esp_err_t ringFileUnixToIsoWeek(uint64_t unixSeconds, uint32_t *outIsoYear, uint32_t *outIsoWeek);
+```
+
+`ringFileUnixToBucketId()` computes the key value the ring uses (also
+usable to build the 8-byte key for `ringFileReadByKey()` /
+`ringFileUpdateByKey()`). `ringFileUnixToIsoWeek()` returns the ISO-8601
+week-numbering year and week (weeks start Monday; week 1 contains the
+first Thursday) for display — 2025-12-29 is ISO 2026-W01. An invalid
+granularity is `ESP_ERR_INVALID_ARG`.
+
 ### Result codes (quick reference)
 
 Standard ESP-IDF codes: `ESP_OK`, `ESP_ERR_INVALID_ARG`, `ESP_ERR_NO_MEM`,
@@ -1162,6 +1279,8 @@ Custom codes share base `RING_FILE_STORE_ERR_BASE` (0x5600):
 | `..._ERR_STORAGE_FULL` | resize candidate could not be created/filled (volume full) |
 | `..._ERR_ALREADY_EXISTS` | create refused to overwrite an existing file |
 | `..._ERR_BUSY` | another writable handle holds `<path>.lck` |
+| `..._ERR_NOT_NEWER` | TIMEBUCKET add/upsert with a `timeStamp` not newer than the newest stored record (use `ringFileEdit`) |
+| `..._ERR_BUCKET_OUT_OF_RANGE` | TIMEBUCKET `ringFileEdit` for a bucket outside the retained window |
 
 `esp_err_to_name()` prints a bare `"ERROR"` for these custom codes — the
 example maps them with a local `rfsErrName()` helper (see `main/main.c`).

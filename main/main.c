@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [9] 18-11-2026 - 19:40
+//-- FileVersion: [10] 19-11-2026 - 09:06
 //--
 //-- ringFileStore - Example application for the ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -155,6 +155,10 @@ static const char *rfsErrName(esp_err_t err)
       return "ALREADY_EXISTS";
     case RING_FILE_STORE_ERR_BUSY:
       return "BUSY";
+    case RING_FILE_STORE_ERR_NOT_NEWER:
+      return "NOT_NEWER";
+    case RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE:
+      return "BUCKET_OUT_OF_RANGE";
     default:
       return esp_err_to_name(err);
   }
@@ -575,6 +579,129 @@ static void demoKeyMaskRing(void)
   ringFileClose(handle);
 }
 
+//-- Timestamp ring file (TIMEBUCKET addressing): the component derives the
+//-- key from the uint64_t timeStamp field at a fixed granularity (hour,
+//-- day, ISO week starting Monday, month). Many timestamps map to the same
+//-- bucket and overwrite that record; add() refuses a timestamp that is
+//-- not newer (use ringFileEdit for lost measurements); order, eviction
+//-- and the reported slot (bucketId % capacity) follow the bucket.
+static void demoTimeStampRing(void)
+{
+  char path[128];
+  snprintf(path, sizeof(path), "%s/timestamp.rfs", CONFIG_EXAMPLE_MOUNT_POINT);
+
+  if (ringFileBreakStaleLock(path) == ESP_OK)
+  {
+    ESP_LOGW(TAG, "cleared stale lock (timestamp ring) from an interrupted run");
+  }
+
+  ringFileConfig_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.maxRecords = 3;                     //-- three hourly buckets
+  cfg.schemaId = 0x54535431;              //-- "TST1"
+  cfg.schemaVersion = 1;
+  cfg.recordSize = sizeof(meterRecord_t);
+  cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
+  cfg.addressing = RING_FILE_ADDRESSING_TIMEBUCKET;
+  cfg.granularity = RING_FILE_GRANULARITY_HOUR;
+  cfg.timestampOffset = (uint32_t)offsetof(meterRecord_t, timestamp);
+
+  ringFileHandle_t *handle = NULL;
+  esp_err_t err = ringFileCreate(path, &cfg, &handle);
+
+  if (err == RING_FILE_STORE_ERR_ALREADY_EXISTS)
+  {
+    ringFileOpenConfig_t ocfg;
+    memset(&ocfg, 0, sizeof(ocfg));
+    ocfg.expectedSchemaId = 0x54535431;
+    ocfg.expectedSchemaVersion = 1;
+    ocfg.expectedRecordSize = sizeof(meterRecord_t);
+    ocfg.expectedAddressing = RING_FILE_ADDRESSING_TIMEBUCKET;
+    ocfg.expectedGranularity = RING_FILE_GRANULARITY_HOUR;
+    ocfg.expectedTimestampOffset = (uint32_t)offsetof(meterRecord_t, timestamp);
+    ESP_ERROR_CHECK(ringFileOpen(path, &ocfg, &handle));
+  }
+  else
+  {
+    ESP_ERROR_CHECK(err);
+  }
+
+  ringFileInfo_t info;
+  ESP_ERROR_CHECK(ringFileGetInfo(handle, &info));
+  ESP_LOGI(TAG, "timestamp ring: addressing=%d granularity=%d tsOffset=%u",
+           (int)info.addressing, (int)info.granularity,
+           (unsigned)info.timestampOffset);
+
+  meterRecord_t rec;
+  meterRecord_t out;
+
+  //-- Start from a known-empty ring so every boot logs the same scenario.
+  ESP_ERROR_CHECK(ringFileClear(handle));
+
+  uint64_t tsH09 = 0, tsH10 = 0, tsH10Late = 0, tsH11 = 0, tsH12 = 0;
+  ESP_ERROR_CHECK(ringFileTimeStampStringToUnix("20261023090000", &tsH09));
+  ESP_ERROR_CHECK(ringFileTimeStampStringToUnix("20261023100000", &tsH10));
+  ESP_ERROR_CHECK(ringFileTimeStampStringToUnix("20261023105959", &tsH10Late));
+  ESP_ERROR_CHECK(ringFileTimeStampStringToUnix("20261023110000", &tsH11));
+  ESP_ERROR_CHECK(ringFileTimeStampStringToUnix("20261023120000", &tsH12));
+
+  char stamp[15];
+  ESP_ERROR_CHECK(ringFileUnixToTimeStampString(tsH10, stamp));
+  ESP_LOGI(TAG, "  helpers: \"20261023100000\" <-> %llu <-> \"%s\"",
+           (unsigned long long)tsH10, stamp);
+
+  uint32_t isoYear = 0, isoWeek = 0;
+  ESP_ERROR_CHECK(ringFileUnixToIsoWeek(tsH10, &isoYear, &isoWeek));
+  ESP_LOGI(TAG, "  ringFileUnixToIsoWeek -> %u-W%02u", (unsigned)isoYear,
+           (unsigned)isoWeek);
+
+  mkRecord(&rec, tsH10, 1000, 0);
+  err = ringFileAdd(handle, &rec);
+  ESP_LOGI(TAG, "  add 10:00:00: %s", rfsErrName(err));
+  mkRecord(&rec, tsH11, 1100, 0);
+  err = ringFileAdd(handle, &rec);
+  ESP_LOGI(TAG, "  add 11:00:00: %s", rfsErrName(err));
+
+  mkRecord(&rec, tsH10Late, 1059, 1);
+  err = ringFileAdd(handle, &rec);
+  ESP_LOGI(TAG, "  add 10:59:59 (same hour bucket -> overwrite): %s",
+           rfsErrName(err));
+
+  mkRecord(&rec, tsH09, 900, 0);
+  err = ringFileAdd(handle, &rec);
+  ESP_LOGI(TAG, "  add 09:00:00 (not newer than newest): %s",
+           rfsErrName(err));
+
+  mkRecord(&rec, tsH10, 1005, 0);
+  err = ringFileUpsert(handle, &rec);
+  ESP_LOGI(TAG, "  upsert hour 10 (any timestamp): %s", rfsErrName(err));
+
+  mkRecord(&rec, tsH12, 1200, 0);
+  err = ringFileEdit(handle, &rec);
+  ESP_LOGI(TAG, "  edit 12:00:00 (append newer bucket): %s", rfsErrName(err));
+
+  mkRecord(&rec, tsH09, 900, 0);
+  err = ringFileEdit(handle, &rec);
+  ESP_LOGI(TAG, "  edit 09:00:00 (outside retained window): %s",
+           rfsErrName(err));
+
+  uint64_t bucket = 0;
+  ESP_ERROR_CHECK(ringFileUnixToBucketId(tsH11, RING_FILE_GRANULARITY_HOUR,
+                                         &bucket));
+  err = ringFileReadByKey(handle, &bucket, &out);
+  ESP_LOGI(TAG, "  readByKey(bucketId %llu of 11:00): %s",
+           (unsigned long long)bucket, rfsErrName(err));
+
+  if (err == ESP_OK)
+  {
+    logRecord("  read result", &out);
+  }
+
+  dumpRing(handle, "timestamp scenario (slot = bucketId %% capacity)");
+  esp_task_wdt_reset();
+  ringFileClose(handle);
+}
+
 void app_main(void)
 {
   ESP_LOGI(TAG, "ring_file_store example starting (backend: %s)",
@@ -656,6 +783,9 @@ void app_main(void)
   esp_task_wdt_reset();
   vTaskDelay(pdMS_TO_TICKS(10));
   demoKeyMaskRing();
+  esp_task_wdt_reset();
+  vTaskDelay(pdMS_TO_TICKS(10));
+  demoTimeStampRing();
   esp_task_wdt_reset();
   vTaskDelay(pdMS_TO_TICKS(10));
 

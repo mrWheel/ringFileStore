@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [2] 18-11-2026 - 19:05
+//-- FileVersion: [3] 19-11-2026 - 09:06
 //--
 //-- ringFileStore - host-side automated tests for the ring_file_store
 //-- component.
@@ -1864,6 +1864,507 @@ static void testKeyPositionMask(void)
          "(mask limited to positions 0-63) -> rejected");
 }
 
+//-- ---------------------------------------------------------------------------
+//-- Timestamp helpers and TIMEBUCKET addressing
+//-- ---------------------------------------------------------------------------
+
+static uint32_t testCrc32(const uint8_t *data, size_t len)
+{
+  uint32_t state = 0xFFFFFFFFu;
+
+  for (size_t i = 0; i < len; i++)
+  {
+    state ^= data[i];
+
+    for (int bit = 0; bit < 8; bit++)
+    {
+      state = (state & 1u) ? ((state >> 1) ^ 0xEDB88320u) : (state >> 1);
+    }
+  }
+
+  return ~state;
+}
+
+static void testTimeHelpers(void)
+{
+  uint64_t ts = 0;
+
+  //-- Known anchor values (unix seconds, wall clock treated as UTC).
+  CHECK_ERR(ringFileTimeStampStringToUnix("20000101000000", &ts), ESP_OK);
+  CHECK(ts == 946684800ULL);
+  logCmd(ESP_OK, "ringFileTimeStampStringToUnix(\"20000101000000\") = 946684800");
+
+  CHECK_ERR(ringFileTimeStampStringToUnix("20240229000000", &ts), ESP_OK);
+  CHECK(ts == 1709164800ULL);
+  logCmd(ESP_OK, "ringFileTimeStampStringToUnix(\"20240229000000\") leap day "
+         "= 1709164800");
+
+  CHECK_ERR(ringFileTimeStampStringToUnix("20991231235959", &ts), ESP_OK);
+  CHECK(ts == 4102444799ULL);
+
+  CHECK_ERR(ringFileTimeStampStringToUnix("20261023123300", &ts), ESP_OK);
+
+  //-- Rejections: invalid second/minute/hour/month/day, wrong century,
+  //-- non-digits, wrong length, NULL.
+  CHECK_ERR(ringFileTimeStampStringToUnix("20261023123378", &ts), ESP_ERR_INVALID_ARG);
+  logCmd(ESP_ERR_INVALID_ARG, "\"20261023123378\": second 78 rejected");
+  CHECK_ERR(ringFileTimeStampStringToUnix("20261023126000", &ts), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileTimeStampStringToUnix("20261023240000", &ts), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileTimeStampStringToUnix("20261301000000", &ts), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileTimeStampStringToUnix("20261032000000", &ts), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileTimeStampStringToUnix("20230229000000", &ts), ESP_ERR_INVALID_ARG);
+  logCmd(ESP_ERR_INVALID_ARG, "\"20230229000000\": 2023 is not a leap year");
+  CHECK_ERR(ringFileTimeStampStringToUnix("21000101000000", &ts), ESP_ERR_INVALID_ARG);
+  logCmd(ESP_ERR_INVALID_ARG, "\"21000101000000\": century 21 rejected");
+  CHECK_ERR(ringFileTimeStampStringToUnix("19991231235959", &ts), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileTimeStampStringToUnix("2026102312330a", &ts), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileTimeStampStringToUnix("2026102312330", &ts), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileTimeStampStringToUnix("202610231233000", &ts), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileTimeStampStringToUnix("", &ts), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileTimeStampStringToUnix(NULL, &ts), ESP_ERR_INVALID_ARG);
+
+  //-- Inverse conversion and round-trip.
+  char stamp[15];
+  memset(stamp, 0, sizeof(stamp));
+  CHECK_ERR(ringFileUnixToTimeStampString(946684800ULL, stamp), ESP_OK);
+  CHECK(strcmp(stamp, "20000101000000") == 0);
+  CHECK_ERR(ringFileUnixToTimeStampString(1709164800ULL, stamp), ESP_OK);
+  CHECK(strcmp(stamp, "20240229000000") == 0);
+  CHECK_ERR(ringFileUnixToTimeStampString(4102444799ULL, stamp), ESP_OK);
+  CHECK(strcmp(stamp, "20991231235959") == 0);
+  CHECK_ERR(ringFileUnixToTimeStampString(946684799ULL, stamp), ESP_ERR_INVALID_ARG);
+  logCmd(ESP_ERR_INVALID_ARG, "ringFileUnixToTimeStampString(946684799): "
+         "before 2000 rejected");
+  CHECK_ERR(ringFileUnixToTimeStampString(4102444800ULL, stamp), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileUnixToTimeStampString(946684800ULL, NULL), ESP_ERR_INVALID_ARG);
+
+  CHECK_ERR(ringFileUnixToTimeStampString(ts, stamp), ESP_OK);
+  CHECK(strcmp(stamp, "20261023123300") == 0);
+  logCmd(ESP_OK, "round-trip unix -> \"20261023123300\"");
+
+  //-- Buckets: hour and day are pure divisions; the week bucket starts
+  //-- Monday 00:00 and the month bucket uses (EEYY-1)*12+MM.
+  uint64_t sunday = 0, monday = 0;
+  CHECK(ringFileTimeStampStringToUnix("20260104123300", &sunday) == ESP_OK);
+  CHECK(ringFileTimeStampStringToUnix("20260105000000", &monday) == ESP_OK);
+
+  uint64_t bHour = 0, bDay = 0, bWeekSun = 0, bWeekMon = 0, bMonth = 0;
+  CHECK_ERR(ringFileUnixToBucketId(sunday, RING_FILE_GRANULARITY_HOUR, &bHour),
+            ESP_OK);
+  CHECK(bHour == sunday / 3600ULL);
+  CHECK_ERR(ringFileUnixToBucketId(sunday, RING_FILE_GRANULARITY_DAY, &bDay), ESP_OK);
+  CHECK(bDay == sunday / 86400ULL);
+  CHECK_ERR(ringFileUnixToBucketId(sunday, RING_FILE_GRANULARITY_WEEK, &bWeekSun),
+            ESP_OK);
+  CHECK_ERR(ringFileUnixToBucketId(monday, RING_FILE_GRANULARITY_WEEK, &bWeekMon),
+            ESP_OK);
+  CHECK((monday + 259200ULL) % 604800ULL == 0ULL);
+  CHECK(bWeekSun + 1ULL == bWeekMon);
+  logCmd(ESP_OK, "week buckets: Sunday 2026-01-04 -> %llu, Monday "
+         "2026-01-05 -> %llu (Monday starts the bucket)",
+         (unsigned long long)bWeekSun, (unsigned long long)bWeekMon);
+
+  CHECK_ERR(ringFileUnixToBucketId(ts, RING_FILE_GRANULARITY_MONTH, &bMonth), ESP_OK);
+  CHECK(bMonth == (2026u - 1u) * 12u + 10u);
+  logCmd(ESP_OK, "month bucket 2026-10 = (2026-1)*12+10 = %llu",
+         (unsigned long long)bMonth);
+  CHECK_ERR(ringFileUnixToBucketId(ts, RING_FILE_GRANULARITY_NONE, &bMonth),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileUnixToBucketId(ts, (ringFileGranularity_t)9, &bMonth),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileUnixToBucketId(ts, RING_FILE_GRANULARITY_HOUR, NULL),
+            ESP_ERR_INVALID_ARG);
+
+  //-- ISO-8601 weeks: weeks start Monday; 2025-12-29 already belongs to
+  //-- ISO 2026-W01 (that week's Thursday is 2026-01-01).
+  uint64_t xmas29 = 0;
+  CHECK(ringFileTimeStampStringToUnix("20251229000000", &xmas29) == ESP_OK);
+  uint32_t isoYear = 0, isoWeek = 0;
+  CHECK_ERR(ringFileUnixToIsoWeek(xmas29, &isoYear, &isoWeek), ESP_OK);
+  CHECK(isoYear == 2026 && isoWeek == 1);
+  logCmd(ESP_OK, "ringFileUnixToIsoWeek(2025-12-29) = %u-W%02u",
+         (unsigned)isoYear, (unsigned)isoWeek);
+  CHECK_ERR(ringFileUnixToIsoWeek(sunday, &isoYear, &isoWeek), ESP_OK);
+  CHECK(isoYear == 2026 && isoWeek == 1);
+  CHECK_ERR(ringFileUnixToIsoWeek(monday, &isoYear, &isoWeek), ESP_OK);
+  CHECK(isoYear == 2026 && isoWeek == 2);
+  CHECK_ERR(ringFileUnixToIsoWeek(xmas29, NULL, &isoWeek), ESP_ERR_INVALID_ARG);
+}
+
+static ringFileConfig_t timeBucketConfig(uint32_t capacity,
+                                         ringFileGranularity_t granularity,
+                                         ringFilePersistMode_t persistMode,
+                                         uint16_t maxPending)
+{
+  ringFileConfig_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.maxRecords = capacity;
+  cfg.schemaId = 77;
+  cfg.schemaVersion = 1;
+  cfg.recordSize = sizeof(meterRec_t);
+  cfg.persistMode = persistMode;
+  cfg.maxPendingRecords = maxPending;
+  cfg.addressing = RING_FILE_ADDRESSING_TIMEBUCKET;
+  cfg.granularity = granularity;
+  cfg.timestampOffset = (uint32_t)offsetof(meterRec_t, timestamp);
+  return cfg;
+}
+
+static ringFileOpenConfig_t timeBucketOpen(ringFileGranularity_t granularity)
+{
+  ringFileOpenConfig_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.expectedSchemaId = 77;
+  cfg.expectedSchemaVersion = 1;
+  cfg.expectedRecordSize = sizeof(meterRec_t);
+  cfg.expectedAddressing = RING_FILE_ADDRESSING_TIMEBUCKET;
+  cfg.expectedGranularity = granularity;
+  cfg.expectedTimestampOffset = (uint32_t)offsetof(meterRec_t, timestamp);
+  return cfg;
+}
+
+static void testTimeBucketRing(void)
+{
+  char path[300];
+  ringPath(path, sizeof(path), "timebucket");
+
+  ringFileConfig_t cfg = timeBucketConfig(3, RING_FILE_GRANULARITY_HOUR,
+                                          RING_FILE_PERSIST_IMMEDIATE, 0);
+  ringFileHandle_t *h = NULL;
+  esp_err_t err = ringFileCreate(path, &cfg, &h);
+  CHECK_ERR(err, ESP_OK);
+  logCmd(err, "ringFileCreate(TIMEBUCKET, HOUR, capacity=3, "
+         "timestampOffset=%u)", (unsigned)cfg.timestampOffset);
+
+  ringFileInfo_t info;
+  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
+  CHECK(info.addressing == RING_FILE_ADDRESSING_TIMEBUCKET);
+  CHECK(info.granularity == RING_FILE_GRANULARITY_HOUR);
+  CHECK(info.timestampOffset == (uint32_t)offsetof(meterRec_t, timestamp));
+
+  meterRec_t rec, out;
+  uint64_t tsH09 = 0, tsH10 = 0, tsH10late = 0, tsH11 = 0, tsH12 = 0, tsH13 = 0;
+  CHECK(ringFileTimeStampStringToUnix("20261023090000", &tsH09) == ESP_OK);
+  CHECK(ringFileTimeStampStringToUnix("20261023100000", &tsH10) == ESP_OK);
+  CHECK(ringFileTimeStampStringToUnix("20261023105959", &tsH10late) == ESP_OK);
+  CHECK(ringFileTimeStampStringToUnix("20261023110000", &tsH11) == ESP_OK);
+  CHECK(ringFileTimeStampStringToUnix("20261023120000", &tsH12) == ESP_OK);
+  CHECK(ringFileTimeStampStringToUnix("20261023130000", &tsH13) == ESP_OK);
+
+  uint64_t bH09 = 0, bH10 = 0, bH11 = 0, bH12 = 0, bH13 = 0;
+  CHECK(ringFileUnixToBucketId(tsH09, RING_FILE_GRANULARITY_HOUR, &bH09) == ESP_OK);
+  CHECK(ringFileUnixToBucketId(tsH10, RING_FILE_GRANULARITY_HOUR, &bH10) == ESP_OK);
+  CHECK(ringFileUnixToBucketId(tsH11, RING_FILE_GRANULARITY_HOUR, &bH11) == ESP_OK);
+  CHECK(ringFileUnixToBucketId(tsH12, RING_FILE_GRANULARITY_HOUR, &bH12) == ESP_OK);
+  CHECK(ringFileUnixToBucketId(tsH13, RING_FILE_GRANULARITY_HOUR, &bH13) == ESP_OK);
+  CHECK(bH09 + 1 == bH10 && bH10 + 1 == bH11 && bH11 + 1 == bH12 &&
+        bH12 + 1 == bH13);
+
+  mkMeter(&rec, tsH10, 100, 0);
+  err = ringFileAdd(h, &rec);
+  CHECK_ERR(err, ESP_OK);
+  logCmd(err, "ringFileAdd(hour 10)");
+
+  mkMeter(&rec, tsH11, 110, 0);
+  err = ringFileAdd(h, &rec);
+  CHECK_ERR(err, ESP_OK);
+  logCmd(err, "ringFileAdd(hour 11)");
+
+  //-- Same bucket: many timestamps map to hour 10; add overwrites.
+  mkMeter(&rec, tsH10late, 105, 1);
+  err = ringFileAdd(h, &rec);
+  CHECK_ERR(err, ESP_OK);
+  CHECK(infoCount(h) == 2);
+  CHECK_ERR(ringFileReadByKey(h, &bH10, &out), ESP_OK);
+  CHECK(out.energyWh == 105 && out.errorCount == 1);
+  logCmd(err, "ringFileAdd(hour 10 again at 10:59:59): same bucket "
+         "overwritten");
+
+  //-- Inactive older bucket: clock rewind through add is refused.
+  mkMeter(&rec, tsH09, 90, 0);
+  err = ringFileAdd(h, &rec);
+  CHECK_ERR(err, RING_FILE_STORE_ERR_NOT_NEWER);
+  CHECK_ERR(ringFileReadByKey(h, &bH09, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
+  logCmd(err, "ringFileAdd(hour 09: not newer -> refused, nothing stored");
+
+  //-- Upsert updates an active bucket for any timestamp.
+  mkMeter(&rec, tsH10, 106, 0);
+  err = ringFileUpsert(h, &rec);
+  CHECK_ERR(err, ESP_OK);
+  CHECK_ERR(ringFileReadByKey(h, &bH10, &out), ESP_OK);
+  CHECK(out.energyWh == 106);
+  logCmd(err, "ringFileUpsert(hour 10 at 10:00:00): active bucket updated "
+         "with any timestamp");
+
+  //-- Upsert add path follows the newer rule.
+  mkMeter(&rec, tsH09, 90, 0);
+  err = ringFileUpsert(h, &rec);
+  CHECK_ERR(err, RING_FILE_STORE_ERR_NOT_NEWER);
+  logCmd(err, "ringFileUpsert(hour 09 as new bucket): not newer -> refused");
+
+  //-- Order follows bucketId, not insertion seq.
+  meterRec_t oldest, newest;
+  CHECK_ERR(ringFileReadOldest(h, &oldest), ESP_OK);
+  CHECK(oldest.timestamp == tsH10);
+  CHECK_ERR(ringFileReadNewest(h, &newest), ESP_OK);
+  CHECK(newest.timestamp == tsH11);
+
+  //-- Edit: append a newer bucket.
+  mkMeter(&rec, tsH12, 120, 0);
+  err = ringFileEdit(h, &rec);
+  CHECK_ERR(err, ESP_OK);
+  CHECK(infoCount(h) == 3);
+  logCmd(err, "ringFileEdit(hour 12): newer bucket appended");
+
+  //-- Edit for an evicted-ago bucket: outside the retained window
+  //-- [newestBucket - capacity + 1, newestBucket] = [bucket(10), bucket(12)].
+  mkMeter(&rec, tsH09, 90, 0);
+  err = ringFileEdit(h, &rec);
+  CHECK_ERR(err, RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE);
+  CHECK(infoCount(h) == 3);
+  logCmd(err, "ringFileEdit(hour 09): outside retained window -> rejected");
+
+  //-- Edit an active bucket with any timestamp.
+  mkMeter(&rec, tsH10, 107, 2);
+  err = ringFileEdit(h, &rec);
+  CHECK_ERR(err, ESP_OK);
+  CHECK_ERR(ringFileReadByKey(h, &bH10, &out), ESP_OK);
+  CHECK(out.energyWh == 107 && out.errorCount == 2);
+  logCmd(err, "ringFileEdit(hour 10): active bucket updated");
+
+  //-- Eviction drops the oldest bucket.
+  mkMeter(&rec, tsH13, 130, 0);
+  err = ringFileAdd(h, &rec);
+  CHECK_ERR(err, ESP_OK);
+  CHECK(infoCount(h) == 3);
+  CHECK_ERR(ringFileReadOldest(h, &oldest), ESP_OK);
+  CHECK(oldest.timestamp == tsH11);
+  CHECK_ERR(ringFileReadNewest(h, &newest), ESP_OK);
+  CHECK(newest.timestamp == tsH13);
+  CHECK_ERR(ringFileReadByKey(h, &bH10, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
+  logCmd(err, "ringFileAdd(hour 13): oldest bucket (hour 10) evicted");
+
+  //-- Iterator walks by bucket order; GetSlot reports bucketId % capacity.
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  meterRec_t step;
+  uint64_t expectTs[3] = {tsH11, tsH12, tsH13};
+  uint64_t expectBucket[3] = {bH11, bH12, bH13};
+
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &step),
+            ESP_OK);
+
+  for (int i = 0; i < 3; i++)
+  {
+    CHECK(step.timestamp == expectTs[i]);
+    uint32_t slot = RING_FILE_SLOT_STAGED;
+    CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slot), ESP_OK);
+    CHECK(slot == (uint32_t)(expectBucket[i] % 3u));
+
+    if (i < 2)
+    {
+      CHECK_ERR(ringFileIteratorNext(h, &it, &step), ESP_OK);
+    }
+  }
+
+  CHECK_ERR(ringFileIteratorNext(h, &it, &step), RING_FILE_STORE_ERR_ITER_END);
+  logCmd(ESP_OK, "iterator: bucket order, logical slot = bucketId %% capacity");
+
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_KEY, &bH12, &step), ESP_OK);
+  CHECK(step.timestamp == tsH12);
+  logCmd(ESP_OK, "ringFileIteratorBegin(KEY, bucketId of hour 12)");
+
+  logRingDump(h, "TIMEBUCKET scenario (adds, overwrite, edit, eviction)");
+  ringFileClose(h);
+
+  //-- Reopen with matching expectations; every mismatch is a schema error.
+  ringFileOpenConfig_t ocfg = timeBucketOpen(RING_FILE_GRANULARITY_HOUR);
+  CHECK_ERR(ringFileOpen(path, &ocfg, &h), ESP_OK);
+  CHECK(infoCount(h) == 3);
+  ringFileClose(h);
+
+  ocfg = timeBucketOpen(RING_FILE_GRANULARITY_DAY);
+  err = ringFileOpen(path, &ocfg, &h);
+  CHECK_ERR(err, RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
+  logCmd(err, "reopen expecting DAY granularity -> schema mismatch");
+
+  ocfg = timeBucketOpen(RING_FILE_GRANULARITY_HOUR);
+  ocfg.expectedAddressing = RING_FILE_ADDRESSING_INSERTION;
+  CHECK_ERR(ringFileOpen(path, &ocfg, &h), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
+
+  ocfg = timeBucketOpen(RING_FILE_GRANULARITY_HOUR);
+  ocfg.expectedTimestampOffset = 4;
+  CHECK_ERR(ringFileOpen(path, &ocfg, &h), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
+
+  //-- Resize keeps the newest buckets.
+  ocfg = timeBucketOpen(RING_FILE_GRANULARITY_HOUR);
+  CHECK_ERR(ringFileOpen(path, &ocfg, &h), ESP_OK);
+  CHECK_ERR(ringFileResize(h, 2), ESP_OK);
+  CHECK(infoCount(h) == 2);
+  CHECK_ERR(ringFileReadOldest(h, &oldest), ESP_OK);
+  CHECK(oldest.timestamp == tsH12);
+  CHECK_ERR(ringFileReadNewest(h, &newest), ESP_OK);
+  CHECK(newest.timestamp == tsH13);
+  logCmd(ESP_OK, "ringFileResize(2): newest buckets (12, 13) retained");
+  ringFileClose(h);
+
+  //-- ringFileEdit on an insertion-mode ring is rejected.
+  ringPath(path, sizeof(path), "timeins");
+  ringFileConfig_t insCfg = meterConfig(3);
+  CHECK_ERR(ringFileCreate(path, &insCfg, &h), ESP_OK);
+  mkMeter(&rec, 5, 5, 0);
+  err = ringFileEdit(h, &rec);
+  CHECK_ERR(err, ESP_ERR_INVALID_STATE);
+  logCmd(err, "ringFileEdit on INSERTION ring -> INVALID_STATE");
+  ringFileClose(h);
+
+  //-- Invalid TIMEBUCKET configurations are rejected at create.
+  cfg = timeBucketConfig(3, RING_FILE_GRANULARITY_HOUR,
+                         RING_FILE_PERSIST_IMMEDIATE, 0);
+  cfg.timestampOffset = (uint32_t)sizeof(meterRec_t) - 4u;  //-- 8 bytes do not fit
+  err = ringFileCreate(path, &cfg, &h);
+  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
+  logCmd(err, "create TIMEBUCKET with timestampOffset+8 > recordSize -> rejected");
+
+  cfg = timeBucketConfig(3, RING_FILE_GRANULARITY_NONE,
+                         RING_FILE_PERSIST_IMMEDIATE, 0);
+  err = ringFileCreate(path, &cfg, &h);
+  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
+
+  cfg = timeBucketConfig(3, (ringFileGranularity_t)9, RING_FILE_PERSIST_IMMEDIATE, 0);
+  err = ringFileCreate(path, &cfg, &h);
+  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
+  logCmd(err, "create TIMEBUCKET with invalid granularity -> rejected");
+}
+
+static void testTimeBucketBufferedAndV2(void)
+{
+  //-- Buffered TIMEBUCKET: staged reads see the overlay, the staged slot
+  //-- marker is reported, a flush commits and reopen shows the day records.
+  char path[300];
+  ringPath(path, sizeof(path), "timebuf");
+  ringFileConfig_t cfg = timeBucketConfig(4, RING_FILE_GRANULARITY_DAY,
+                                          RING_FILE_PERSIST_BUFFERED, 4);
+  ringFileHandle_t *h = NULL;
+  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_OK);
+  logCmd(ESP_OK, "ringFileCreate(TIMEBUCKET, DAY, buffered maxPending=4)");
+
+  meterRec_t rec, out;
+  uint64_t day1early = 0, day1late = 0, day2 = 0;
+  CHECK(ringFileTimeStampStringToUnix("20261001010000", &day1early) == ESP_OK);
+  CHECK(ringFileTimeStampStringToUnix("20261001180000", &day1late) == ESP_OK);
+  CHECK(ringFileTimeStampStringToUnix("20261002120000", &day2) == ESP_OK);
+
+  mkMeter(&rec, day1early, 1, 0);
+  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  mkMeter(&rec, day1late, 2, 0);
+  CHECK_ERR(ringFileUpsert(h, &rec), ESP_OK);   //-- same bucket → staged overwrite
+  mkMeter(&rec, day2, 20, 0);
+  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  CHECK(infoCount(h) == 2);
+
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  meterRec_t step;
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &step),
+            ESP_OK);
+  CHECK(step.timestamp == day1late && step.energyWh == 2);
+  uint32_t slot = 0;
+  CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slot), ESP_OK);
+  CHECK(slot == RING_FILE_SLOT_STAGED);
+  logCmd(ESP_OK, "buffered: staged same-day overwrite visible, slot staged");
+  CHECK_ERR(ringFileIteratorNext(h, &it, &step), ESP_OK);
+  CHECK(step.timestamp == day2);
+  CHECK_ERR(ringFileIteratorNext(h, &it, &step), RING_FILE_STORE_ERR_ITER_END);
+
+  CHECK_ERR(ringFileSync(h), ESP_OK);
+
+  //-- A fresh cursor after the flush reports the logical day bucket slot.
+  uint64_t bDay2 = 0;
+  CHECK(ringFileUnixToBucketId(day2, RING_FILE_GRANULARITY_DAY, &bDay2) == ESP_OK);
+  ringFileIterator_t it2;
+  memset(&it2, 0, sizeof(it2));
+  CHECK_ERR(ringFileIteratorBegin(h, &it2, RING_FILE_ITER_KEY, &bDay2, &step),
+            ESP_OK);
+  CHECK_ERR(ringFileIteratorGetSlot(h, &it2, &slot), ESP_OK);
+  CHECK(slot == (uint32_t)(bDay2 % 4u));
+  logCmd(ESP_OK, "after sync: logical slot = bucketId %% capacity = %lu",
+         (unsigned long)slot);
+  ringFileClose(h);
+
+  ringFileOpenConfig_t ocfg = timeBucketOpen(RING_FILE_GRANULARITY_DAY);
+  CHECK_ERR(ringFileOpen(path, &ocfg, &h), ESP_OK);
+  CHECK(infoCount(h) == 2);
+  meterRec_t oldest;
+  CHECK_ERR(ringFileReadOldest(h, &oldest), ESP_OK);
+  CHECK(oldest.timestamp == day1late && oldest.energyWh == 2);
+  ringFileClose(h);
+  logCmd(ESP_OK, "reopen buffered DAY ring: two committed day records");
+
+  //-- Format-version-2 compatibility: a v2 header (insertion semantics,
+  //-- no addressing fields) still opens and behaves like before.
+  ringPath(path, sizeof(path), "timev2");
+  ringFileConfig_t insCfg = meterConfig(3);
+  CHECK_ERR(ringFileCreate(path, &insCfg, &h), ESP_OK);
+  mkMeter(&rec, 100, 1000, 0);
+  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  ringFileClose(h);
+
+  int fd = open(path, O_RDWR);
+
+  if (fd < 0)
+  {
+    printf("  FATAL open %s for v2 patch\n", path);
+    exit(2);
+  }
+
+  uint8_t hdr[96];
+
+  if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr))
+  {
+    printf("  FATAL read header %s\n", path);
+    exit(2);
+  }
+
+  CHECK(hdr[4] == 3u);   //-- current format version
+  hdr[4] = 2u;           //-- formatVersion = 2 (little-endian u16)
+  hdr[5] = 0u;
+  uint32_t crc = testCrc32(hdr, 88);
+  hdr[88] = (uint8_t)crc;
+  hdr[89] = (uint8_t)(crc >> 8);
+  hdr[90] = (uint8_t)(crc >> 16);
+  hdr[91] = (uint8_t)(crc >> 24);
+
+  if (lseek(fd, 0, SEEK_SET) != 0 ||
+      write(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr))
+  {
+    printf("  FATAL patch header %s\n", path);
+    exit(2);
+  }
+
+  close(fd);
+  logCmdText("patched", "header patched: formatVersion 3 -> 2, CRC recomputed");
+
+  ringFileOpenConfig_t v2cfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
+  CHECK_ERR(ringFileOpen(path, &v2cfg, &h), ESP_OK);
+  uint64_t k100 = 100;
+  CHECK_ERR(ringFileReadByKey(h, &k100, &out), ESP_OK);
+  CHECK(out.energyWh == 1000);
+
+  //-- Insertion semantics: an out-of-order (smaller) key is accepted and
+  //-- oldest/newest follow seq, not key order.
+  mkMeter(&rec, 50, 500, 0);
+  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  meterRec_t oldestRec, newestRec;
+  CHECK_ERR(ringFileReadOldest(h, &oldestRec), ESP_OK);
+  CHECK(oldestRec.timestamp == 100);
+  CHECK_ERR(ringFileReadNewest(h, &newestRec), ESP_OK);
+  CHECK(newestRec.timestamp == 50);
+  ringFileClose(h);
+  logCmd(ESP_OK, "v2 file: insertion semantics kept (out-of-order key "
+         "accepted, oldest/newest by seq)");
+}
+
 int main(int argc, char *argv[])
 {
   snprintf(sDir, sizeof(sDir), "/tmp/rfs_test_XXXXXX");
@@ -1906,6 +2407,9 @@ int main(int argc, char *argv[])
     {"validateGoodRing", testValidateGoodRing},
     {"moreRecords", testMoreRecords},
     {"keyPositionMask", testKeyPositionMask},
+    {"timeHelpers", testTimeHelpers},
+    {"timeBucketRing", testTimeBucketRing},
+    {"timeBucketBufferedAndV2", testTimeBucketBufferedAndV2},
   };
 
   //-- testLog.md: path from argv[1] so run_tests.sh can place it in the

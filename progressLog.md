@@ -243,3 +243,35 @@ English.
   projectPrompt `FileVersion: [1]` header block to README.md (first
   project .md to carry it). No code or component files touched; docs
   only.
+
+## 19-11-2026
+
+- 09:06 — Timestamp support (TIMEBUCKET addressing) per developer design
+  answers: new private module `src/rfs_time.c/.h` (Hinnant civil<->days,
+  "EEYYMMDDHHMMSS" <-> unix seconds with validation, bucketId formulas
+  HOUR/DAY/WEEK-Monday/MONTH=(EEYY-1)*12+MM per DSMRlogger32, ISO-8601
+  week helper); public API extended (ringFileAddressingMode_t,
+  ringFileGranularity_t, config/open/info fields, ringFileEdit,
+  ringFileTimeStampStringToUnix, ringFileUnixToTimeStampString,
+  ringFileUnixToBucketId, ringFileUnixToIsoWeek; errors NOT_NEWER +16,
+  BUCKET_OUT_OF_RANGE +17). Core: key extraction derives the bucketId
+  from the uint64_t timeStamp field; rank/oldest/newest/iterator/
+  KthOldest/resize order by bucketId in TIMEBUCKET mode; add overwrites
+  the same bucket and rejects not-newer timestamps; edit backfills inside
+  the retained window; ringFileIteratorGetSlot reports the logical
+  bucketId % capacity; header format version 3 (addressing/granularity/
+  timestampOffset at 64/68/72, v2 files still open with insertion
+  semantics); open validates the expected addressing schema. Physical
+  placement stays on the crash-safe free-slot protocol (no in-place
+  overwrite of committed slots). Tests: run_tests.sh and CMakeLists
+  compile rfs_time.c; 168 new checks (helpers incl. the 946684800 anchor,
+  leap 2024-02-29 vs 2023-02-29, century/second/hour rejections, Monday
+  bucket and ISO 2026-W01 boundaries; TIMEBUCKET ring: overwrite,
+  NOT_NEWER, edit window, bucket-ordered eviction/resize, logical slots,
+  schema-mismatch on addressing fields, buffered staged path,
+  patched-v2-header compatibility). Suite: 801 checks / 0 failures;
+  idf.py build (esp32s3) clean. Docs: root README (timestamp section +
+  new API + result codes + tests coverage), component README (Timestamp
+  ring files section, format table v3), test README coverage bullets;
+  main.c demoTimeStampRing() added. Boot-notice deliverable
+  (projectPrompt item 6) remains open from earlier sessions.

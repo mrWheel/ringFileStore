@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [2] 18-11-2026 - 19:05
+//-- FileVersion: [3] 19-11-2026 - 09:06
 //--
 //-- ringFileStore - public C API of the ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -23,6 +23,13 @@
 //-- committed state. The header is only written by create, resize and clear.
 //--
 //-- All functions run in task context and may block on storage I/O.
+//--
+//-- Timestamp ring files: with config.addressing =
+//-- RING_FILE_ADDRESSING_TIMEBUCKET the component derives the key
+//-- (bucketId) from a uint64_t timeStamp field (unix seconds of the local
+//-- wall clock treated as if UTC) at a fixed granularity (hour, day,
+//-- ISO-8601 week starting Monday, month). Order, eviction and resize
+//-- retention then follow bucketId; see README.md "Timestamp ring files".
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -75,6 +82,14 @@ typedef enum
   RING_FILE_STORE_ERR_ALREADY_EXISTS = RING_FILE_STORE_ERR_BASE + 14,
   //-- Another writable handle already holds the exclusive lock file.
   RING_FILE_STORE_ERR_BUSY = RING_FILE_STORE_ERR_BASE + 15,
+  //-- TIMEBUCKET mode: ringFileAdd()/ringFileUpsert() add path rejected a
+  //-- timeStamp that is not newer than the newest stored record (clock
+  //-- rewind or gap fill). Nothing changed; use ringFileEdit().
+  RING_FILE_STORE_ERR_NOT_NEWER = RING_FILE_STORE_ERR_BASE + 16,
+  //-- TIMEBUCKET mode: ringFileEdit() requested a bucket outside the
+  //-- retained window [newestBucket - capacity + 1, newestBucket].
+  //-- Nothing changed.
+  RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE = RING_FILE_STORE_ERR_BASE + 17,
 } ringFileErr_t;
 
 //-- Supported key field types (fixed-width, stored inside the record).
@@ -116,6 +131,34 @@ typedef struct
   uint64_t keyPositionMask;
 } ringFileKeyDescriptor_t;
 
+//-- How the identifying key of a record is determined.
+typedef enum
+{
+  //-- Default. The caller-supplied key descriptor locates the key inside
+  //-- the record; oldest/newest follow insertion order (seq).
+  RING_FILE_ADDRESSING_INSERTION = 0,
+  //-- Timestamp mode: the component derives a bucketId from the
+  //-- uint64_t timeStamp field (unix seconds) at the configured
+  //-- granularity. The key is that bucketId (U64, 8 bytes, little-endian)
+  //-- and oldest/newest follow bucket order. cfg.key is ignored.
+  RING_FILE_ADDRESSING_TIMEBUCKET = 1,
+} ringFileAddressingMode_t;
+
+//-- Timestamp granularity for TIMEBUCKET addressing. The bucketId
+//-- formulas (ts = unix seconds) are fixed by the DSMRlogger32 baseline:
+//-- HOUR   ts / 3600
+//-- DAY    ts / 86400
+//-- WEEK   (ts + 259200) / 604800   (boundaries at Monday 00:00, ISO-8601)
+//-- MONTH  (EEYY - 1) * 12 + MM     (DSMRlogger32 month formula)
+typedef enum
+{
+  RING_FILE_GRANULARITY_NONE = 0,   //-- only valid with INSERTION addressing
+  RING_FILE_GRANULARITY_HOUR = 1,
+  RING_FILE_GRANULARITY_DAY = 2,
+  RING_FILE_GRANULARITY_WEEK = 3,
+  RING_FILE_GRANULARITY_MONTH = 4,
+} ringFileGranularity_t;
+
 //-- Persistence mode.
 typedef enum
 {
@@ -137,11 +180,20 @@ typedef struct
   uint32_t schemaId;               //-- caller-chosen schema identifier.
   uint32_t schemaVersion;          //-- bump on every layout change.
   uint16_t recordSize;             //-- sizeof the caller record struct.
-  ringFileKeyDescriptor_t key;
+  ringFileKeyDescriptor_t key;       //-- ignored when addressing ==
+                                     //-- RING_FILE_ADDRESSING_TIMEBUCKET
   ringFilePersistMode_t persistMode;
   //-- Buffered mode: maximum number of staged records (1..64). 0 selects
   //-- the default of 8. Ignored in immediate mode.
   uint16_t maxPendingRecords;
+  //-- Key derivation mode (see ringFileAddressingMode_t).
+  ringFileAddressingMode_t addressing;
+  //-- TIMEBUCKET mode: bucket granularity (1..4). Invalid (or NONE) with
+  //-- TIMEBUCKET addressing.
+  ringFileGranularity_t granularity;
+  //-- TIMEBUCKET mode: byte offset of the uint64_t timeStamp field inside
+  //-- the record. Must satisfy timestampOffset + 8 <= recordSize.
+  uint32_t timestampOffset;
 } ringFileConfig_t;
 
 //-- Open configuration: the expected schema is validated against the file.
@@ -153,6 +205,12 @@ typedef struct
   bool readOnly;                   //-- no writes, no locking, no recovery.
   ringFilePersistMode_t persistMode;
   uint16_t maxPendingRecords;
+  //-- Expected key derivation mode; a mismatch with the stored header is
+  //-- RING_FILE_STORE_ERR_SCHEMA_MISMATCH. A format-version-2 file is
+  //-- INSERTION addressing regardless of its reserved bytes.
+  ringFileAddressingMode_t expectedAddressing;
+  ringFileGranularity_t expectedGranularity;
+  uint32_t expectedTimestampOffset;
 } ringFileOpenConfig_t;
 
 //-- Snapshot for ringFileGetInfo().
@@ -168,6 +226,9 @@ typedef struct
   bool dirty;                      //-- uncommitted changes outstanding.
   uint64_t keyPositionMask;        //-- from the file header (0 = all
                                    //-- positions significant).
+  ringFileAddressingMode_t addressing;   //-- from the file header.
+  ringFileGranularity_t granularity;     //-- NONE in insertion mode.
+  uint32_t timestampOffset;              //-- 0 in insertion mode.
 } ringFileInfo_t;
 
 //-- Result of ringFileValidate(). Read-only integrity inspection.
@@ -198,7 +259,8 @@ typedef struct
 //-- cursor. Treat it as opaque after ringFileIteratorBegin().
 typedef struct
 {
-  uint64_t cursorSeq;              //-- internal: seq of the last returned record.
+  uint64_t cursorSeq;              //-- internal: seq of the last returned record
+                                   //-- (bucketId order value in TIMEBUCKET mode).
   uint32_t stamp;                  //-- internal: mutation generation.
   uint32_t slot;                   //-- internal: physical slot of the last
                                    //-- returned record (RING_FILE_SLOT_STAGED
@@ -279,6 +341,16 @@ esp_err_t ringFileUpdateByKey(ringFileHandle_t *handle, const void *key,
 //-- atomic with respect to other users of this handle.
 esp_err_t ringFileUpsert(ringFileHandle_t *handle, const void *record);
 
+//-- TIMEBUCKET addressing only (ESP_ERR_INVALID_STATE otherwise):
+//-- backfill/edit the file when measurements for one or more buckets were
+//-- lost. Updates the active record of the record's bucket for any
+//-- timeStamp; otherwise inserts the bucket as a new record when it lies
+//-- inside the retained window
+//-- [newestBucket - capacity + 1, newestBucket] (an empty ring accepts
+//-- any bucket; at capacity the oldest bucket is evicted). Outside the
+//-- window: RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE, nothing changed.
+esp_err_t ringFileEdit(ringFileHandle_t *handle, const void *record);
+
 //-- Copy the first / last record in insertion order.
 esp_err_t ringFileReadOldest(ringFileHandle_t *handle, void *outRecord);
 esp_err_t ringFileReadNewest(ringFileHandle_t *handle, void *outRecord);
@@ -308,7 +380,10 @@ esp_err_t ringFileIteratorPrevious(ringFileHandle_t *handle,
                                    ringFileIterator_t *iterator, void *outRecord);
 
 //-- Report the physical slot index (0 .. capacity) of the record the
-//-- cursor last returned, for diagnostics and test logging. Returns
+//-- cursor last returned, for diagnostics and test logging. In
+//-- TIMEBUCKET mode this reports the logical slot bucketId % capacity
+//-- (DSMRlogger-style direct offset); physical placement stays with the
+//-- crash-safe commit protocol. Returns
 //-- RING_FILE_STORE_ERR_ITER_INVALIDATED when the cursor was invalidated
 //-- by a mutation, and RING_FILE_STORE_ERR_ITER_END semantics do not
 //-- apply (the slot of the last successful record is kept). A staged
@@ -353,6 +428,42 @@ esp_err_t ringFileBreakStaleLock(const char *path);
 //-- earlier records are hidden. Uses the same commit rules as a header
 //-- write (create/resize).
 esp_err_t ringFileClear(ringFileHandle_t *handle);
+
+//-- ---------------------------------------------------------------------------
+//-- Timestamp helpers (usable with or without an open ring).
+//--
+//-- Time basis: the local wall clock is treated as if it were UTC
+//-- (DSMRlogger32-compatible); daylight saving time is ignored.
+//--
+//-- Parse "EEYYMMDDHHMMSS" (exactly 14 digits) into unix seconds.
+//-- Validation: century digits must be "20" (years 2000-2099), month
+//-- 01-12, day valid for the month (leap years included), hour 00-23,
+//-- minute 00-59, second 00-59. Anything else: ESP_ERR_INVALID_ARG.
+//-- Example: "20000101000000" -> 946684800.
+esp_err_t ringFileTimeStampStringToUnix(const char *timeStamp,
+                                        uint64_t *outUnixSeconds);
+
+//-- Inverse of ringFileTimeStampStringToUnix(). outTimeStamp receives 14
+//-- digits plus a terminating NUL (buffer of at least 15 bytes). Values
+//-- outside 2000-01-01 00:00:00 .. 2099-12-31 23:59:59 give
+//-- ESP_ERR_INVALID_ARG.
+esp_err_t ringFileUnixToTimeStampString(uint64_t unixSeconds,
+                                        char outTimeStamp[15]);
+
+//-- Compute the TIMEBUCKET key value (bucketId) for a timestamp:
+//-- HOUR   unixSeconds / 3600
+//-- DAY    unixSeconds / 86400
+//-- WEEK   (unixSeconds + 259200) / 604800   (Monday 00:00 boundaries)
+//-- MONTH  (EEYY - 1) * 12 + MM              (DSMRlogger32 formula)
+esp_err_t ringFileUnixToBucketId(uint64_t unixSeconds,
+                                 ringFileGranularity_t granularity,
+                                 uint64_t *outBucketId);
+
+//-- ISO-8601 week-numbering year and week number for display (weeks
+//-- start Monday; week 1 contains the first Thursday of the year).
+//-- 2025-12-29 yields year 2026, week 1.
+esp_err_t ringFileUnixToIsoWeek(uint64_t unixSeconds, uint32_t *outIsoYear,
+                                uint32_t *outIsoWeek);
 
 //-- Practical update-or-add pattern for a logger revising the current
 //-- hourly record: build the record, then

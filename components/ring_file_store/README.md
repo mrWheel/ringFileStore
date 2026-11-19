@@ -1,3 +1,10 @@
+```
+FileVersion: [1] 19-11-2026 - 09:06
+
+ringFileStore - component README: usage, binary format, commit protocol.
+Copyright (C) 2026 Willem Aandewiel (mrWheel)
+```
+
 # ring_file_store
 
 Persistent fixed-capacity ring files for ESP-IDF (tested against ESP-IDF
@@ -6,6 +13,11 @@ binary slots on any ESP-IDF VFS filesystem (LittleFS, FATFS on SD). One
 caller-defined key field inside the record identifies a record. "Oldest"
 and "newest" always mean insertion order; keys may arrive out of order and
 numeric gaps consume no storage.
+
+Time-series files can instead run in **TIMEBUCKET addressing**: the
+component derives the key from a `uint64_t timeStamp` field at a
+granularity chosen at create time (hour, day, ISO week starting Monday,
+month), the DSMRlogger32 pattern. See *Timestamp ring files* below.
 
 The design reuses the fixed-slot storage principle of
 [DSMRlogger32](https://github.com/mrWheel/DSMRlogger32) (direct offset seek
@@ -57,15 +69,19 @@ ringFileClose(ring);
 | `ringFileReadByKey` | Copy active record for a key. |
 | `ringFileUpdateByKey` | Replace the complete record, preserve insertion position. Replacement with a differing embedded key: `ESP_ERR_INVALID_ARG`. Identical replacement: no write at all. |
 | `ringFileUpsert` | Atomic update-or-add under the handle lock (the hourly-logger pattern). |
+| `ringFileEdit` | TIMEBUCKET mode only: backfill/edit a bucket (lost measurements). Updates the active record of the bucket, otherwise inserts it when it lies inside the retained window. |
 | `ringFileReadOldest` / `ringFileReadNewest` | First/last record in insertion order. |
 | `ringFileIteratorBegin/Next/Previous` | Caller-owned cursors; start at oldest, newest or an exact key; traverse either direction; `ITER_END` at the logical ends; successful mutations invalidate cursors. |
-| `ringFileIteratorGetSlot` | Physical slot index of the record the cursor last returned (`RING_FILE_SLOT_STAGED` for an unflushed staged record). For diagnostics and test logging. |
+| `ringFileIteratorGetSlot` | Physical slot index of the record the cursor last returned (`RING_FILE_SLOT_STAGED` for an unflushed staged record). In TIMEBUCKET mode this is the **logical** slot `bucketId % capacity`. For diagnostics and test logging. |
 | `ringFileResize` | Change capacity through a verified candidate file plus an atomic rename switch. Shrink keeps the newest records that fit. Capacity ≥ 1. Persists the new capacity. |
 | `ringFileGetInfo` | count, capacity, record size, schema, storage size, pending count, dirty. |
 | `ringFileSync` | Commit pending buffered data and synchronize through the backend. |
 | `ringFileValidate` | Stand-alone read-only integrity check; distinguishes bad metadata from bad record slots and reports stray resize files. |
 | `ringFileBreakStaleLock` | Remove the `<path>.lck` lock file left by an interrupted run. Only for use right after a reset, before the first open, when no live handle can exist. |
 | `ringFileClear` | Discard all records (epoch bump in the header). Schema and capacity retained. |
+| `ringFileTimeStampStringToUnix` / `ringFileUnixToTimeStampString` | Convert between unix seconds and the 14-digit `"EEYYMMDDHHMMSS"` string (century fixed `20`, years 2000–2099). |
+| `ringFileUnixToBucketId` | bucketId for a timestamp at a granularity (also the key value used by the keyed calls in TIMEBUCKET mode). |
+| `ringFileUnixToIsoWeek` | ISO-8601 week-numbering year and week number (weeks start Monday) for display. |
 
 ### Result codes
 
@@ -90,6 +106,8 @@ Standard: `ESP_OK`, `ESP_ERR_INVALID_ARG`, `ESP_ERR_NO_MEM`,
 | `..._ERR_STORAGE_FULL` | Candidate file could not be created/filled (volume full). |
 | `..._ERR_ALREADY_EXISTS` | create() refused to overwrite an existing file. |
 | `..._ERR_BUSY` | Another writable handle holds the lock file. |
+| `..._ERR_NOT_NEWER` | TIMEBUCKET add/upsert with a `timeStamp` not newer than the newest stored record (clock rewind or gap fill — use `ringFileEdit`). |
+| `..._ERR_BUCKET_OUT_OF_RANGE` | TIMEBUCKET `ringFileEdit` for a bucket outside the retained window `[newestBucket - capacity + 1, newestBucket]`. |
 
 Memory ownership: all handles are freed by `ringFileClose()` (always safe
 to call, including on a failed operation's handle if you created it
@@ -136,6 +154,111 @@ Example: a `uint64_t` timestamp key with mask `0xFC` compares only bytes
 2..7, so samples that differ only in the low second-bits address the same
 record.
 
+## Timestamp ring files (TIMEBUCKET addressing)
+
+Time-series files (the DSMRlogger32 pattern) can let the component derive
+the key from the measurement time instead of a caller-chosen key. The
+record carries `uint64_t timeStamp` — unix seconds of the **local wall
+clock treated as if UTC** (DSMRlogger32-compatible; DST ignored) — at the
+byte offset given by `timestampOffset`, and the component computes a
+**bucketId** from it at the granularity chosen at create time. Many
+timestamps map to the same bucket; they all address the same record and
+overwriting that record is correct behaviour.
+
+```c
+typedef struct
+{
+  uint64_t timeStamp;   //-- unix seconds; the key is derived from this field
+  uint32_t energyWh;
+  uint16_t errorCount;
+  uint16_t pad;
+} hourRecord_t;
+
+ringFileConfig_t cfg = {0};
+cfg.maxRecords = 24;                        //-- 24 hourly buckets
+cfg.schemaId = 0x484F5531;
+cfg.schemaVersion = 1;
+cfg.recordSize = sizeof(hourRecord_t);
+cfg.addressing = RING_FILE_ADDRESSING_TIMEBUCKET;
+cfg.granularity = RING_FILE_GRANULARITY_HOUR;
+cfg.timestampOffset = offsetof(hourRecord_t, timeStamp);
+//-- cfg.key is ignored: the component forces the key to the computed
+//-- bucketId (U64, 8 bytes, at timestampOffset, mask 0).
+```
+
+`ringFileOpen()` must repeat the same expectations
+(`expectedAddressing`, `expectedGranularity`, `expectedTimestampOffset`);
+a mismatch with the stored schema is `..._ERR_SCHEMA_MISMATCH`. The stored
+mode is part of the file header (format version 3); version-2 files keep
+their old insertion semantics unchanged.
+
+### Granularities
+
+| `ringFileGranularity_t` | bucketId | boundary |
+| --- | --- | --- |
+| `RING_FILE_GRANULARITY_HOUR` | `unixSeconds / 3600` | hour |
+| `RING_FILE_GRANULARITY_DAY` | `unixSeconds / 86400` | midnight |
+| `RING_FILE_GRANULARITY_WEEK` | `(unixSeconds + 259200) / 604800` | **Monday 00:00** (ISO-8601 week) |
+| `RING_FILE_GRANULARITY_MONTH` | `(EEYY - 1) * 12 + MM` | month start (DSMRlogger32 formula; 2026-10 → 24310) |
+
+Oldest/newest order, iteration order, eviction and resize retention all
+follow **bucketId** in this mode instead of insertion seq.
+`ringFileIteratorGetSlot()` reports the logical slot
+`bucketId % capacity` — the DSMRlogger-style direct-offset number — while
+physical placement stays with the crash-safe commit protocol below (a
+committed slot is never overwritten in place).
+
+### Timestamp strings
+
+The string form is the 14-digit `"EEYYMMDDHHMMSS"` with the century fixed
+to `20` (years 2000–2099):
+
+```c
+uint64_t ts;
+ESP_ERROR_CHECK(ringFileTimeStampStringToUnix("20261023123300", &ts));
+
+char stamp[15];
+ESP_ERROR_CHECK(ringFileUnixToTimeStampString(ts, stamp));   //-- "20261023123300"
+
+uint64_t bucket;
+ESP_ERROR_CHECK(ringFileUnixToBucketId(ts, RING_FILE_GRANULARITY_HOUR, &bucket));
+
+uint32_t isoYear = 0, isoWeek = 0;
+ESP_ERROR_CHECK(ringFileUnixToIsoWeek(ts, &isoYear, &isoWeek));
+```
+
+Validation on parse: exactly 14 digits, month 01–12, day valid for the
+month (leap years included — 2024-02-29 passes, 2023-02-29 is rejected),
+hour 00–23, minute and second 00–59; anything else is
+`ESP_ERR_INVALID_ARG`. `ringFileUnixToTimeStampString()` writes 14 digits
+plus a NUL and rejects values outside 2000-01-01 00:00:00 ..
+2099-12-31 23:59:59.
+
+### Time-ordered writes
+
+* **ringFileAdd**: if the bucket is already active its record is
+  overwritten (same bucket = same record); otherwise the record is
+  appended when its `timeStamp` is **newer than the newest stored
+  record**. A `timeStamp` that is not newer (clock rewind, or filling a
+  gap) is rejected with `..._ERR_NOT_NEWER` without any change — use
+  `ringFileEdit` for that.
+* **ringFileUpsert**: updates the active record of the bucket for **any**
+  `timeStamp` — the last-added record therefore stays updatable while
+  time stays in its bucket (the hourly-logger pattern); otherwise the add
+  rules apply.
+* **ringFileEdit**: backfill/edit for lost measurements. Updates the
+  bucket when active (any `timeStamp`); otherwise inserts the bucket when
+  it lies inside the retained window
+  `[newestBucket - capacity + 1, newestBucket]` (an empty ring accepts
+  any bucket). Outside that window the record was evicted long ago:
+  `..._ERR_BUCKET_OUT_OF_RANGE`, nothing changes.
+
+`ringFileReadByKey`, `ringFileUpdateByKey` and iterator-by-key address
+records by the 8-byte **little-endian bucketId** — compute it with
+`ringFileUnixToBucketId()` (the raw `uint64_t` works directly on
+little-endian targets). `ringFileClear`, resize, locking, buffered mode
+and the commit protocol behave exactly as in insertion mode.
+
 ## Binary format
 
 ```
@@ -151,7 +274,7 @@ Header (written only by create, resize and clear):
 | Offset | Size | Field |
 | --- | --- | --- |
 | 0 | u32 | magic `RFS1` (0x52465331) |
-| 4 | u16 | format version (2) |
+| 4 | u16 | format version (3; version-2 files still open with insertion semantics) |
 | 6 | u16 | header size (96) |
 | 8 | u64 | generation (incremented per resize) |
 | 16 | u32 | schema id |
@@ -164,7 +287,10 @@ Header (written only by create, resize and clear):
 | 44 | u32 | flags (0) |
 | 48 | u64 | epoch (records with seq < epoch are hidden; set by `ringFileClear`) |
 | 56 | u64 | key position mask (0 = all positions significant) |
-| 64 | 24 B | reserved (0xFFFFFFFF) |
+| 64 | u32 | addressing mode (0 = insertion, 1 = timebucket; version-2 files: reserved) |
+| 68 | u32 | granularity (1 hour, 2 day, 3 week, 4 month; 0 in insertion mode) |
+| 72 | u32 | timestamp offset (byte offset of the `uint64_t timeStamp` field; 0 in insertion mode) |
+| 76 | 12 B | reserved (0xFFFFFFFF) |
 | 88 | u32 | CRC32 over bytes [0,88) |
 | 92 | u32 | reserved (0xFFFFFFFF) |
 
