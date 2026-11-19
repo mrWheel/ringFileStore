@@ -1,8 +1,9 @@
 //--
-//-- FileVersion: [2] 19-11-2026 - 11:40
+//-- FileVersion: [3] 19-11-2026 - 13:25
 //--
 //-- ringFileStore - timestamp helpers for the timestamp key model.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
 //--
 #include <stdio.h>
 #include <string.h>
@@ -24,6 +25,13 @@
 //--   MINUTE  days * 1440 + hour * 60 + minute
 //--   SECOND  days * 86400 + hour * 3600 + minute * 60 + second
 //-- bucketId (the DSMRlogger-style logical slot) is period % capacity.
+//-- "days" counts only the COMPLETE days before the date (days_from_civil
+//-- maps 1970-01-01 to 0), so a partial current period never counts as a
+//-- full unit: on day D the hourly period at 14:xx is D * 24 + 14 — the
+//-- current day contributes its completed hours only, never the full 24.
+//-- The day/minute/second formulas behave the same way. The month formula
+//-- counts the months of the previous years plus the index of the current
+//-- month (DSMRlogger32 baseline): (year - 1) * 12 + month.
 //---------------------------------------------------------------------
 
 #define RFS_TIME_SECONDS_PER_DAY 86400ull

@@ -1,3 +1,10 @@
+//--
+//-- FileVersion: [1] 19-11-2026 - 13:25
+//--
+//-- ringFileStore - internal file-operations table for backend injection.
+//-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
+//--
 #ifndef RFS_FILE_IO_H
 #define RFS_FILE_IO_H
 

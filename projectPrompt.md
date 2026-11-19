@@ -1,6 +1,11 @@
-```
-FileVersion: [2] 19-11-2026 - 11:40
-```
+<!--
+ FileVersion: [3] 19-11-2026 - 13:25
+
+ ringFileStore - project prompt: requirements and rules for this project.
+ Copyright (C) 2026 Willem Aandewiel (mrWheel)
+ SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # Implement a persistent ring-file component for ESP-IDF
 
 Implement a reusable ESP-IDF component named `ring_file_store` in readable C for ESP-IDF 6.0.2, with ESP32-S3 as the initial target. Use Allman braces, lowerCamelCase for local variables and English comments. Minimizing storage wear is a primary design requirement, subject to the selected durability policy. Use an opaque handle and a public C header with an `extern "C"` guard for C++ callers.
@@ -126,7 +131,7 @@ text with a short description specific to that file.
 //--
 ```
 
-Use HTML-Comment block for all .md files
+Use HTML-Comment block for all `<document>.md` files
 
 ```text
 <!--
@@ -138,7 +143,9 @@ Use HTML-Comment block for all .md files
 -->
 ```
 
-`<nr>` must be incremented at every change of this file. `<date/time>` as "DD-MM-EEYY - HH:MM"
+`<nr>` must be incremented at every change of this file. `<date/time>` as "DD-MM-EEYY - HH:MM".
+
+Use Europe/Amsterdam time
 
 ## Deliverables and verification
 

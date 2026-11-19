@@ -1,6 +1,6 @@
 # ringFileStore — test log (host suite)
 
-Generated: 19-11-2026 - 12:35 — host tests with POSIX shims and failure-injection.
+Generated: 19-11-2026 - 15:00 — host tests with POSIX shims and failure-injection.
 
 Every stored record carries the automatic key fields timeStamp and usedKey; ring dumps show both plus the reported bucketId (period % capacity).
 
@@ -89,8 +89,8 @@ Every stored record carries the automatic key fields timeStamp and usedKey; ring
   - bucketId 0 ts=20261023040000 usedKey=2026102304 energyWh=104 errorCount=4
 - **Command:** ringFileAdd(months 202610, 202611)
   **Result:** ESP_OK
-- **Test result:** 75 checks, 0 new failures
-| bucketAndKeyDerivation | 75 | 0 |
+- **Test result:** 99 checks, 0 new failures
+| bucketAndKeyDerivation | 99 | 0 |
 
 ## Test: evictionOrder
 - **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=0)
@@ -426,4 +426,4 @@ Every stored record carries the automatic key fields timeStamp and usedKey; ring
 
 ## Summary
 
-**PASS**: 594 checks, 0 failures.
+**PASS**: 618 checks, 0 failures.

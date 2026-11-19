@@ -1,3 +1,10 @@
+//--
+//-- FileVersion: [1] 19-11-2026 - 13:25
+//--
+//-- ringFileStore - host test shim for the ESP-IDF esp_err.h API.
+//-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
+//--
 #ifndef SHIM_ESP_ERR_H
 #define SHIM_ESP_ERR_H
 

@@ -1,3 +1,10 @@
+//--
+//-- FileVersion: [1] 19-11-2026 - 13:25
+//--
+//-- ringFileStore - host test shim: FreeRTOS mutexes on pthread mutexes.
+//-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
+//--
 #ifndef SHIM_SEMPHR_H
 #define SHIM_SEMPHR_H
 

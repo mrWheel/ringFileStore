@@ -1,12 +1,9 @@
 <!--
- FileVersion: [<nr>] <date/time>
+ FileVersion: [3] 19-11-2026 - 13:25
 
-
-FileVersion: [2] 19-11-2026 - 11:40
-
-ringFileStore - component README: usage, binary format, commit protocol.
-Copyright (C) 2026 Willem Aandewiel (mrWheel)
-SPDX-License-Identifier: GPL-3.0-or-later
+ ringFileStore - component README: usage, binary format, commit protocol.
+ Copyright (C) 2026 Willem Aandewiel (mrWheel)
+ SPDX-License-Identifier: GPL-3.0-or-later
 -->
 
 # ring_file_store
@@ -94,6 +91,13 @@ always:
   | `"YYMMDDhh"` | days * 24 + hour | hour |
   | `"YYMMDDhhmm"` | days * 1440 + hour * 60 + minute | minute |
   | `"YYMMDDhhmmss"` | days * 86400 + hour * 3600 + minute * 60 + second | second |
+
+  "days" counts the **complete** days before the date (1970-01-01 → 0), so
+  a partial current period never counts as a full unit: on day D the
+  hourly period at 14:xx is D * 24 + 14 — the current day contributes its
+  completed hours only, never the full 24 h. The month formula counts the
+  months of the previous years plus the index of the current month
+  (DSMRlogger32 baseline).
 
 Oldest/newest order, iteration order, eviction and resize retention all
 follow the **period**. Physical placement stays with the crash-safe commit

@@ -1,8 +1,9 @@
 //--
-//-- FileVersion: [2] 19-11-2026 - 11:40
+//-- FileVersion: [3] 19-11-2026 - 13:25
 //--
-//-- ringFileStore - timestamp helpers for the timestamp key model.
+//-- ringFileStore - internal declarations of the timestamp helpers.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
 //--
 #ifndef RFS_TIME_H
 #define RFS_TIME_H

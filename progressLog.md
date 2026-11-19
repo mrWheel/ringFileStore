@@ -1,3 +1,11 @@
+<!--
+ FileVersion: [4] 19-11-2026 - 15:02
+
+ ringFileStore - progress log: what was tried per session and the result.
+ Copyright (C) 2026 Willem Aandewiel (mrWheel)
+ SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # Project log
 
 Format: DD-MM-YYYY - HH:MM — what was tried, result, errors/findings.
@@ -308,3 +316,94 @@ English.
   (developer handles uploads).
 
   Open: none.
+
+- 12:42 — First on-hardware run aborted: `ringFileOpen()` returned
+  RING_FILE_STORE_ERR_FORMAT (0x5607) on /rfs/meter.rfs — the file on
+  flash was still a v2/v3-era header from the previous firmware and the
+  example treated a failed reopen as fatal (ESP_ERROR_CHECK in
+  app_main). Component behaviour is correct (incompatible layout must not
+  open); fixed in main.c [12]: new openOrRecreateRing() helper breaks the
+  stale lock, creates or reopens, and on FORMAT/CORRUPT/SCHEMA_MISMATCH
+  logs a warning, unlinks the old file and creates a fresh ring (example
+  self-heal after a firmware upgrade; production apps should archive
+  first). All read-write opens in the example now go through the helper
+  (main ring, reopen, buffered logger, resize/validate, monthly, sensor).
+  idf.py build (esp32s3) clean. Awaiting reflash by the developer.
+
+- 12:55 — Second on-hardware crash after reflash: boot N ran all demos and
+  the resize demo left meter.rfs at capacity 3; capacity comes from the
+  file (not the config), so boot N+1 reopened it at capacity 3 and
+  demoRingOperations aborted on ringFileReadByKey(hour 11) =
+  KEY_NOT_FOUND (0x5602) via ESP_ERROR_CHECK. Example-only issue; fixed in
+  main.c [13]: after the initial open app_main now reads the stored
+  capacity and resizes to RING_CAPACITY when it differs, so every boot
+  replays the same scenario. Also: testLog.md had vanished from the repo
+  root — it is written only by the host suite (a device run cannot write
+  it); ./run_tests.sh regenerated it (PASS 594 checks / 0 failures).
+  idf.py build (esp32s3) rebuild in progress.
+
+- 13:35 — Three follow-up requests from the developer:
+  1. testLog.md must come back after a DEMO run, not only after the host
+     suite. Added `components/ring_file_store/test/run_device_test.sh`
+     (+ `device_capture.py`): builds, flashes to the serial port, resets
+     the target, captures the console until the `example finished` marker
+     (90 s timeout) and writes the run to `testLog.md` in the repo root
+     (PASS/FAIL + raw serial in a fenced block). `--no-flash` captures an
+     already-flashed board. Run myself on /dev/tty.usbserial-1430:
+     flash OK, device run PASS to `example finished`, no aborts; the
+     capacity self-heal logged "stored capacity is 3, resizing to 10".
+  2. Period formula review: the day-based formulas already count only
+     COMPLETE days/hours/minutes/seconds (days_from_civil is exclusive:
+     1970-01-01 → 0), so the current day never counts as a full 24 h —
+     e.g. day D at 14:xx gives D*24+14, and 23:00 → next-day 00:00
+     advances by exactly 1. MONTH keeps the approved DSMRlogger32
+     formula (year-1)*12+month. Documented this in rfs_time.c,
+     ring_file_store.h and both READMEs, and added 24 explicit
+     roll-over assertions to the host suite (all granularities,
+     December→January, 31-12→01-01).
+  3. Source file headers per projectPrompt: every .c/.h now starts with
+     the //-- block including SPDX-License-Identifier:
+     GPL-3.0-or-later (added the missing SPDX to rfs_time.c/.h,
+     ring_file_store.h, shim files and the host test; added a header to
+     rfs_file_io.h which had none; ring_file_store.c "File Version"
+     fixed to "FileVersion"); every .md now uses the HTML-comment block
+     (root README, component README — which had a broken duplicated
+     header —, test README, progressLog, projectPrompt, PUBLISHING).
+     realExample32.md left as-is: it is raw DSMR CSV example data.
+     Host suite: PASS 618 checks / 0 failures. No open problems.
+
+- 14:40 — Developer reported that repeated test runs did not refresh
+  testLog.md (stale "Generated: ... 12:35" line). Findings:
+  1. No testLog.md is ever written on the device/LittleFS — the host
+     suite writes it from the Mac, and run_device_test.sh writes the
+     captured device run to the repo root. The stale file was an old
+     (host-suite) copy; its "Generated" line updates correctly on every
+     real run (verified: host suite now stamps 14:29).
+  2. run_device_test.sh aborted via set -e when build/flash failed (a
+     manual idf_monitor from a terminal at 14:21 held the port, so all
+     flash attempts failed) and therefore wrote NO testLog.md at all.
+     The script now never aborts early: build/flash/capture failures are
+     caught and documented in testLog.md (Result: FAIL + reason + the
+     error output), exit code 0/1 as before.
+  3. Fixed a PASS/FAIL bug introduced while hardening: RC stayed 1 on a
+     successful capture; RC is now zeroed before device_capture.py.
+     device_capture.py also distinguishes "cannot open port" (exit 3)
+     from timeout (exit 1). Stale monitor (PID 36610/36611) stopped.
+     Full device run after the fix: PASS (example finished), single
+     clean boot, "stored capacity is 3, resizing to 10" self-heal,
+     Returned from app_main(). No open problems.
+
+- 15:02 — run_device_test.sh refused to build: idf.py reported the active
+  python (tools/python/v6.0.2/venv) differs from the one the build/
+  directory was configured with (python_env/idf6.0_py3.11_env, a
+  PlatformIO-era leftover). Script [5]: ESP-IDF is now activated through
+  the installer script ~/.espressif/tools/activate_idf_v6.0.2.sh called
+  with -e (sourcing it from a non-interactive shell makes it exit),
+  importing its KEY=VALUE pairs plus SYSTEM_PATH and $IDF_PATH/tools
+  (the venv has no idf.py executable); the export.sh routes stay as
+  fallback. A build directory configured with a different python is now
+  cleaned with idf.py fullclean before building. The first full rebuild
+  hit a transient ar/ranlib failure on libesp_https_server.a; the retry
+  completed. A stray Finder copy managed_components/joltwallet__littlefs
+  2 (which made idf.py refuse) was removed by the fullclean. Full device
+  run: PASS (example finished), testLog.md refreshed. No open problems.

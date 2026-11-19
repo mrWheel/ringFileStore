@@ -1,9 +1,10 @@
-```
-FileVersion: [2] 19-11-2026 - 11:40
+<!--
+ FileVersion: [3] 19-11-2026 - 13:25
 
-ringFileStore - host test suite README.
-Copyright (C) 2026 Willem Aandewiel (mrWheel)
-```
+ ringFileStore - host test suite README.
+ Copyright (C) 2026 Willem Aandewiel (mrWheel)
+ SPDX-License-Identifier: GPL-3.0-or-later
+-->
 
 # Component tests
 
@@ -30,7 +31,10 @@ every read returns them. Covered:
 * key derivation for all six file types ("YY".."YYMMDDhhmmss"): usedKey
   truncation and period formulas checked against independent reference
   values (DSMRlogger32 month formula, days-since-epoch day period),
-  bucketId = period % capacity reported by `ringFileIteratorGetSlot`;
+  bucketId = period % capacity reported by `ringFileIteratorGetSlot`,
+  and the partial-current-period rule (a period advances by exactly one
+  at every roll-over; the current day contributes its completed
+  sub-periods only, never a full 24 h);
 * eviction and retention in bucket (period) order, including a 40-record
   fill of a capacity-16 ring walked oldest → newest;
 * `ringFileUpdateByKey`: derived-key mismatch → `ESP_ERR_INVALID_ARG`,
@@ -70,6 +74,22 @@ command the **Command** (with its data) and its **Result**, the ring
 dumps with timeStamp, usedKey and reported bucketId per record, and a
 per-test overview table.
 
+## Device (example) test run
+
+`run_device_test.sh` builds the ESP32-S3 example, flashes it and captures
+the demo run from the serial console into `testLog.md` in the repository
+root (the same file the host suite writes — the last run wins):
+
+```sh
+./run_device_test.sh                 # build + flash + capture
+./run_device_test.sh --no-flash      # reset the board, capture only
+./run_device_test.sh /dev/tty.usbserial-1430
+```
+
+The script needs the ESP-IDF environment (it sources `export.sh` itself)
+and `pyserial`. It resets the target, waits for the `example finished`
+marker (90 s timeout) and reports PASS/FAIL; the captured serial output
+is stored verbatim in a fenced block.
+
 A future target-side Unity app (on-hardware LittleFS/FATFS runs) can be
-added under this directory; it is out of scope for this session because
-flashing is done manually by the developer.
+added under this directory; it is out of scope for this session.

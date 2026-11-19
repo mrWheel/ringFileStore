@@ -1,3 +1,11 @@
+//--
+//-- FileVersion: [1] 19-11-2026 - 13:25
+//--
+//-- ringFileStore - host test shim for the FreeRTOS primitives used by
+//-- the component.
+//-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
+//--
 #ifndef SHIM_FREERTOS_H
 #define SHIM_FREERTOS_H
 

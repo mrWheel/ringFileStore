@@ -1,3 +1,11 @@
+<!--
+ FileVersion: [1] 19-11-2026 - 13:25
+
+ ringFileStore - how to publish the component to the ESP Component Registry.
+ Copyright (C) 2026 Willem Aandewiel (mrWheel)
+ SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # Publish ringFileStore to the ESP Component Registry
 
 The repository and local ESP-IDF app are named `ringFileStore`. The registry

@@ -1,9 +1,10 @@
-```
-FileVersion: [3] 19-11-2026 - 11:40
+<!--
+ FileVersion: [4] 19-11-2026 - 13:25
 
-ringFileStore - repository README: project overview, usage and API documentation.
-Copyright (C) 2026 Willem Aandewiel (mrWheel)
-```
+ ringFileStore - repository README: project overview, usage and API documentation.
+ Copyright (C) 2026 Willem Aandewiel (mrWheel)
+ SPDX-License-Identifier: GPL-3.0-or-later
+-->
 
 # ringFileStore — persistent ring files for ESP-IDF
 
@@ -157,6 +158,12 @@ stored record = [ u64 timeStamp ][ u64 usedKey ][ caller payload ... ]
   | `"YYMMDDhh"` | days × 24 + hour |
   | `"YYMMDDhhmm"` | days × 1440 + hour × 60 + minute |
   | `"YYMMDDhhmmss"` | days × 86400 + hour × 3600 + minute × 60 + second |
+
+  "days" counts the **complete** days before the date (1970-01-01 → 0), so
+  a partial current period never counts as a full unit: on day D the
+  hourly period at 14:xx is D × 24 + 14 — the current day contributes its
+  completed hours only, never the full 24 h. The month formula counts the
+  months of the previous years plus the index of the current month.
 
   Order, oldest/newest, eviction and resize retention follow the period.
   Physical placement stays with the crash-safe commit protocol — the

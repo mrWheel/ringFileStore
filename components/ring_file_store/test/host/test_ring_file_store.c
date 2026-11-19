@@ -1,9 +1,10 @@
 //--
-//-- FileVersion: [4] 19-11-2026 - 11:40
+//-- FileVersion: [5] 19-11-2026 - 13:25
 //--
 //-- ringFileStore - host-side automated tests for the ring_file_store
 //-- component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
 //--
 //-- The component sources are compiled against small POSIX shims
 //-- (shim/) so the whole suite runs on the dev machine. Storage failures
@@ -1098,6 +1099,64 @@ static void testBucketAndKeyDerivation(void)
   CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 18u, 14u, 30u, 55u),
                                       RING_FILE_GRANULARITY_SECOND, &period), ESP_OK);
   CHECK(period == DAYS_2026_11_18 * 86400ULL + 14ULL * 3600ULL + 30ULL * 60ULL + 55ULL);
+
+  //-- A partial current period never counts as a full unit: the period
+  //-- counts only COMPLETE days/hours/minutes/seconds before the timestamp,
+  //-- so it advances by exactly one when a period rolls over. The current
+  //-- day contributes its completed sub-periods only, never a full 24 h.
+  uint64_t periodA = 0;
+  uint64_t periodB = 0;
+
+  //-- Day rolls over at midnight: the new day starts at the next number.
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 18u, 23u, 59u, 59u),
+                                      RING_FILE_GRANULARITY_DAY, &periodA), ESP_OK);
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 19u, 0u, 0u, 0u),
+                                      RING_FILE_GRANULARITY_DAY, &periodB), ESP_OK);
+  CHECK(periodA == DAYS_2026_11_18);
+  CHECK(periodB == DAYS_2026_11_18 + 1ULL);
+
+  //-- Hour rolls over at midnight: 23:00 is the last hourly bucket of the
+  //-- day; 00:00 the next day is exactly one period later. At 14:00 on
+  //-- day D+1 the day contributes 24 completed hours + 14, not 48.
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 18u, 23u, 59u, 0u),
+                                      RING_FILE_GRANULARITY_HOUR, &periodA), ESP_OK);
+  CHECK(periodA == DAYS_2026_11_18 * 24ULL + 23ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 19u, 0u, 0u, 0u),
+                                      RING_FILE_GRANULARITY_HOUR, &periodB), ESP_OK);
+  CHECK(periodB == periodA + 1ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 19u, 14u, 0u, 0u),
+                                      RING_FILE_GRANULARITY_HOUR, &periodB), ESP_OK);
+  CHECK(periodB == (DAYS_2026_11_18 + 1ULL) * 24ULL + 14ULL);
+
+  //-- Minute and second roll over the same way.
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 18u, 23u, 59u, 0u),
+                                      RING_FILE_GRANULARITY_MINUTE, &periodA), ESP_OK);
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 19u, 0u, 0u, 0u),
+                                      RING_FILE_GRANULARITY_MINUTE, &periodB), ESP_OK);
+  CHECK(periodB == periodA + 1ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 18u, 23u, 59u, 59u),
+                                      RING_FILE_GRANULARITY_SECOND, &periodA), ESP_OK);
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 19u, 0u, 0u, 0u),
+                                      RING_FILE_GRANULARITY_SECOND, &periodB), ESP_OK);
+  CHECK(periodB == periodA + 1ULL);
+
+  //-- Month rolls over at the December -> January boundary with the
+  //-- DSMRlogger32 formula: (year - 1) * 12 + month counts the months of
+  //-- the previous years plus the index of the current month.
+  CHECK_ERR(ringFileTimeStampToPeriod(20261231000000ULL,
+                                      RING_FILE_GRANULARITY_MONTH, &periodA), ESP_OK);
+  CHECK(periodA == 24312ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(20270101000000ULL,
+                                      RING_FILE_GRANULARITY_MONTH, &periodB), ESP_OK);
+  CHECK(periodB == periodA + 1ULL);
+
+  //-- Year rolls over: period advances by one at 31-12 -> 01-01.
+  CHECK_ERR(ringFileTimeStampToPeriod(20261231000000ULL,
+                                      RING_FILE_GRANULARITY_YEAR, &periodA), ESP_OK);
+  CHECK(periodA == 2026ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(20270101000000ULL,
+                                      RING_FILE_GRANULARITY_YEAR, &periodB), ESP_OK);
+  CHECK(periodB == periodA + 1ULL);
 
   //-- Integration: the reported bucketId is period % capacity. For the test
   //-- dates the hourly period is DAYS_2026_10_23 * 24 + hh = 497976 + hh.

@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [11] 19-11-2026 - 11:40
+//-- FileVersion: [13] 19-11-2026 - 12:55
 //--
 //-- ringFileStore - Example application for the ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -27,6 +27,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -252,6 +253,46 @@ static ringFileOpenConfig_t openConfig(bool readOnly)
   cfg.readOnly = readOnly;
   cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
   return cfg;
+}
+
+//-- Create the ring or reopen the existing one. A file left behind by an
+//-- older firmware with an incompatible header/payload layout fails open
+//-- with FORMAT, CORRUPT or SCHEMA_MISMATCH; the example then self-heals
+//-- by dropping the old file and creating a fresh ring of the current
+//-- schema. A production application should archive the data first. The
+//-- stale lock of an interrupted run is cleared before opening (no live
+//-- handle can exist right after a reset).
+static ringFileHandle_t *openOrRecreateRing(const char *path,
+                                            const ringFileConfig_t *cfg,
+                                            const ringFileOpenConfig_t *ocfg)
+{
+  ringFileHandle_t *handle = NULL;
+
+  if (ringFileBreakStaleLock(path) == ESP_OK)
+  {
+    ESP_LOGW(TAG, "cleared stale lock file for %s", path);
+  }
+
+  esp_err_t err = ringFileCreate(path, cfg, &handle);
+
+  if (err == RING_FILE_STORE_ERR_ALREADY_EXISTS)
+  {
+    ESP_LOGI(TAG, "reopening existing ring %s", path);
+    err = ringFileOpen(path, ocfg, &handle);
+
+    if (err == RING_FILE_STORE_ERR_FORMAT ||
+        err == RING_FILE_STORE_ERR_CORRUPT ||
+        err == RING_FILE_STORE_ERR_SCHEMA_MISMATCH)
+    {
+      ESP_LOGW(TAG, "ring %s is from an incompatible firmware (%s), "
+               "recreating", path, rfsErrName(err));
+      unlink(path);
+      err = ringFileCreate(path, cfg, &handle);
+    }
+  }
+
+  ESP_ERROR_CHECK(err);
+  return handle;
 }
 
 static void logRecord(const char *label, const meterFull_t *rec)
@@ -485,12 +526,13 @@ static void demoHourlyLogger(ringFileHandle_t *handle)
 //-- Power-loss window: everything staged since the last sync is lost.
 static void demoHourlyLoggerBuffered(const char *path)
 {
-  ringFileOpenConfig_t cfg = openConfig(false);
+  ringFileConfig_t cfg = baseConfig();
   cfg.persistMode = RING_FILE_PERSIST_BUFFERED;
   cfg.maxPendingRecords = 8;
-  ringFileHandle_t *handle = NULL;
-
-  ESP_ERROR_CHECK(ringFileOpen(path, &cfg, &handle));
+  ringFileOpenConfig_t ocfg = openConfig(false);
+  ocfg.persistMode = RING_FILE_PERSIST_BUFFERED;
+  ocfg.maxPendingRecords = 8;
+  ringFileHandle_t *handle = openOrRecreateRing(path, &cfg, &ocfg);
 
   meterRecord_t staged;
   uint64_t ts23 = mkTs(2026u, 10u, 23u, 23u, 0u, 0u);
@@ -527,9 +569,9 @@ static void demoHourlyLoggerBuffered(const char *path)
 
 static void demoResizeAndValidate(const char *path)
 {
-  ringFileHandle_t *handle = NULL;
+  ringFileConfig_t cfg = baseConfig();
   ringFileOpenConfig_t ocfg = openConfig(false);
-  ESP_ERROR_CHECK(ringFileOpen(path, &ocfg, &handle));
+  ringFileHandle_t *handle = openOrRecreateRing(path, &cfg, &ocfg);
 
   ESP_LOGI(TAG, "-- resize capacity %u -> 14", (unsigned)RING_CAPACITY);
   ESP_ERROR_CHECK(ringFileResize(handle, 14));
@@ -573,21 +615,12 @@ static void demoMonthlyRing(void)
   cfg.recordSize = sizeof(monthRecord_t);
   cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
 
-  ringFileHandle_t *handle = NULL;
-  esp_err_t err = ringFileCreate(path, &cfg, &handle);
-
-  if (err == RING_FILE_STORE_ERR_ALREADY_EXISTS)
-  {
-    ringFileOpenConfig_t ocfg;
-    memset(&ocfg, 0, sizeof(ocfg));
-    ocfg.expectedSchemaId = RING_FILE_SCHEMA_YYMM;
-    ocfg.expectedRecordSize = sizeof(monthRecord_t);
-    ESP_ERROR_CHECK(ringFileOpen(path, &ocfg, &handle));
-  }
-  else
-  {
-    ESP_ERROR_CHECK(err);
-  }
+  ringFileOpenConfig_t ocfg;
+  memset(&ocfg, 0, sizeof(ocfg));
+  ocfg.expectedSchemaId = RING_FILE_SCHEMA_YYMM;
+  ocfg.expectedRecordSize = sizeof(monthRecord_t);
+  ringFileHandle_t *handle = openOrRecreateRing(path, &cfg, &ocfg);
+  esp_err_t err;
 
   ringFileInfo_t info;
   ESP_ERROR_CHECK(ringFileGetInfo(handle, &info));
@@ -683,21 +716,12 @@ static void demoSensorRing(void)
   cfg.recordSize = sizeof(sensorRecord_t);
   cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
 
-  ringFileHandle_t *handle = NULL;
-  esp_err_t err = ringFileCreate(path, &cfg, &handle);
-
-  if (err == RING_FILE_STORE_ERR_ALREADY_EXISTS)
-  {
-    ringFileOpenConfig_t ocfg;
-    memset(&ocfg, 0, sizeof(ocfg));
-    ocfg.expectedSchemaId = RING_FILE_SCHEMA_YYMMDDHHMMSS;
-    ocfg.expectedRecordSize = sizeof(sensorRecord_t);
-    ESP_ERROR_CHECK(ringFileOpen(path, &ocfg, &handle));
-  }
-  else
-  {
-    ESP_ERROR_CHECK(err);
-  }
+  ringFileOpenConfig_t ocfg;
+  memset(&ocfg, 0, sizeof(ocfg));
+  ocfg.expectedSchemaId = RING_FILE_SCHEMA_YYMMDDHHMMSS;
+  ocfg.expectedRecordSize = sizeof(sensorRecord_t);
+  ringFileHandle_t *handle = openOrRecreateRing(path, &cfg, &ocfg);
+  esp_err_t err;
 
   sensorRecord_t rec;
   sensorFull_t out;
@@ -810,28 +834,21 @@ void app_main(void)
   ringFileConfig_t cfg = baseConfig();
   ringFileHandle_t *handle = NULL;
 
-  //-- A previous run that died before ringFileClose() (panic, reset, power
-  //-- loss) leaves its lock file behind, which would block every later open
-  //-- with BUSY forever. Right after a reset no live handle can exist, so
-  //-- taking over the stale lock is safe here.
-  if (ringFileBreakStaleLock(path) == ESP_OK)
-  {
-    ESP_LOGW(TAG, "cleared stale lock file left by an interrupted run");
-  }
-
-  esp_err_t err = ringFileCreate(path, &cfg, &handle);
-
   ringFileOpenConfig_t ocfg = openConfig(false);
+  handle = openOrRecreateRing(path, &cfg, &ocfg);
 
-  if (err == RING_FILE_STORE_ERR_ALREADY_EXISTS)
+  //-- Capacity always comes from the file, never from the create/open
+  //-- config: a previous run may have left the ring resized (the resize
+  //-- demo below shrinks it to 3). Normalise it here so every boot replays
+  //-- the same demonstration scenario at RING_CAPACITY.
+  ringFileInfo_t bootInfo;
+  ESP_ERROR_CHECK(ringFileGetInfo(handle, &bootInfo));
+
+  if (bootInfo.capacity != RING_CAPACITY)
   {
-    ESP_LOGI(TAG, "reopening existing ring %s", path);
-    ESP_ERROR_CHECK(ringFileOpen(path, &ocfg, &handle));
-  }
-  else
-  {
-    ESP_ERROR_CHECK(err);
-    ESP_LOGI(TAG, "created ring %s", path);
+    ESP_LOGI(TAG, "stored capacity is %lu, resizing to %u for the demo",
+             (unsigned long)bootInfo.capacity, (unsigned)RING_CAPACITY);
+    ESP_ERROR_CHECK(ringFileResize(handle, RING_CAPACITY));
   }
 
   dumpRing(handle, "open");
@@ -843,7 +860,7 @@ void app_main(void)
   vTaskDelay(pdMS_TO_TICKS(10));
 
   //-- Reopen read-write after a restart and verify the state survived.
-  ESP_ERROR_CHECK(ringFileOpen(path, &ocfg, &handle));
+  handle = openOrRecreateRing(path, &cfg, &ocfg);
   ringFileInfo_t info;
   ESP_ERROR_CHECK(ringFileGetInfo(handle, &info));
   ESP_LOGI(TAG, "after reopen: count=%lu capacity=%lu type=%s",

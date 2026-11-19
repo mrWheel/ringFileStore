@@ -1,9 +1,10 @@
 //--
-//-- FileVersion: [2] 18-11-2026 - 19:40
+//-- FileVersion: [3] 19-11-2026 - 13:25
 //--
 //-- ringFileStore - POSIX shim for the host tests (esp_err, esp_log,
 //-- FreeRTOS mutex).
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
 //--
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"

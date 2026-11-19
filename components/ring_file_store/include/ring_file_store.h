@@ -1,8 +1,9 @@
 //--
-//-- FileVersion: [4] 19-11-2026 - 11:40
+//-- FileVersion: [5] 19-11-2026 - 13:25
 //--
 //-- ringFileStore - public C API of the ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
 //--
 #ifndef RING_FILE_STORE_H
 #define RING_FILE_STORE_H
@@ -105,15 +106,18 @@ typedef enum
 #define RING_FILE_SCHEMA_MAX_LEN 12u
 
 //-- Timestamp granularity, derived from the file type string. The period
-//-- formulas (ts = the 14-digit EEYYMMDDhhmmss value, days = days since
-//-- 1970-01-01) are fixed by the DSMRlogger32 baseline:
+//-- formulas (ts = the 14-digit EEYYMMDDhhmmss value, days = COMPLETE
+//-- days before the date; 1970-01-01 -> 0) are fixed by the DSMRlogger32
+//-- baseline:
 //-- YEAR    year
 //-- MONTH   (year - 1) * 12 + month            (DSMRlogger32 formula)
 //-- DAY     days
 //-- HOUR    days * 24 + hour
 //-- MINUTE  days * 1440 + hour * 60 + minute
 //-- SECOND  days * 86400 + hour * 3600 + minute * 60 + second
-//-- bucketId (the reported logical slot) is period % capacity.
+//-- bucketId (the reported logical slot) is period % capacity. A partial
+//-- current period never counts as a full unit: on day D the hourly
+//-- period at 14:xx is D * 24 + 14 (completed hours only, not D * 24 + 24).
 typedef enum
 {
   RING_FILE_GRANULARITY_NONE = 0,   //-- invalid for a ring file
