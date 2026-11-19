@@ -224,3 +224,22 @@ English.
     `add key=1765065536 (byte 2 differs): ESP_OK`, dump lists key and
     slot 0/1. Host suite stays 633 checks / 0 failures; testLog.md written
     in English with named results, key/slot dumps and the summary table.
+- 22:35 — Developer request: extensive API documentation appended to the
+  root README.md, 2–3 chained code examples per API call (Example 1/2/3
+  always operate on the same three fixed setups), expected results
+  explained per snippet, at least one non-numeric string key example
+  ("202610"). Added "## API documentation" after "Registry packaging":
+  three connected setups (A: 16 B `meterRecord_t`, u64 timestamp key,
+  capacity 3→2, immediate; B: 16 B `monthRecord_t`, `RING_FILE_KEY_STRING`
+  "YYYYMM" key, capacity 12→24, immediate; C: 12 B `sensorRecord_t`,
+  `RING_FILE_KEY_BYTES` 4-byte device key, capacity 32→2, buffered), then
+  every public call (create, open, close, add, readByKey, updateByKey,
+  upsert, readOldest/Newest, iterator incl. GetSlot, resize, getInfo,
+  sync, validate, clear, breakStaleLock) with its snippets and expected
+  results, plus result-code and buffer-contract tables. All documented
+  behaviours re-verified against `src/ring_file_store.c` (error paths,
+  string-key terminator scan over the full keySize, coalescing, epoch
+  clear, resize candidate flow, lock rules). Also added the
+  projectPrompt `FileVersion: [1]` header block to README.md (first
+  project .md to carry it). No code or component files touched; docs
+  only.
