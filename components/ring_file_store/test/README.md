@@ -1,5 +1,5 @@
 <!--
- FileVersion: [3] 19-11-2026 - 13:25
+ FileVersion: [4] 19-11-2026 - 15:25
 
  ringFileStore - host test suite README.
  Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -30,7 +30,7 @@ every read returns them. Covered:
   acceptance, century not "20", invalid adds leave the ring unchanged;
 * key derivation for all six file types ("YY".."YYMMDDhhmmss"): usedKey
   truncation and period formulas checked against independent reference
-  values (DSMRlogger32 month formula, days-since-epoch day period),
+  values (month formula, days-since-epoch day period),
   bucketId = period % capacity reported by `ringFileIteratorGetSlot`,
   and the partial-current-period rule (a period advances by exactly one
   at every roll-over; the current day contributes its completed

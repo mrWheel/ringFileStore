@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [5] 19-11-2026 - 13:25
+//-- FileVersion: [6] 19-11-2026 - 15:25
 //--
 //-- ringFileStore - public C API of the ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -21,7 +21,7 @@
 //-- or fills the key fields. "Oldest" and "newest" always refer to bucket
 //-- (period) order; the period is derived from the timestamp at the
 //-- granularity of the file type, and bucketId = period % capacity is the
-//-- DSMRlogger32-style logical slot reported by ringFileIteratorGetSlot().
+//-- logical slot reported by ringFileIteratorGetSlot().
 //--
 //-- Storage model (see README.md for the full binary format):
 //--   [ 96-byte header ] [ capacity + 1 slots ]
@@ -93,7 +93,7 @@ typedef enum
   RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE = RING_FILE_STORE_ERR_BASE + 17,
 } ringFileErr_t;
 
-//-- File type strings (schemaId). The two-digit-year DSMRlogger32 form;
+//-- File type strings (schemaId). The two-digit-year form;
 //-- stored timestamps always carry the century (EEYY, fixed to "20").
 #define RING_FILE_SCHEMA_YY "YY"
 #define RING_FILE_SCHEMA_YYMM "YYMM"
@@ -107,10 +107,9 @@ typedef enum
 
 //-- Timestamp granularity, derived from the file type string. The period
 //-- formulas (ts = the 14-digit EEYYMMDDhhmmss value, days = COMPLETE
-//-- days before the date; 1970-01-01 -> 0) are fixed by the DSMRlogger32
-//-- baseline:
+//-- days before the date; 1970-01-01 -> 0) are fixed by the file format:
 //-- YEAR    year
-//-- MONTH   (year - 1) * 12 + month            (DSMRlogger32 formula)
+//-- MONTH   (year - 1) * 12 + month
 //-- DAY     days
 //-- HOUR    days * 24 + hour
 //-- MINUTE  days * 1440 + hour * 60 + minute
@@ -361,8 +360,8 @@ esp_err_t ringFileIteratorNext(ringFileHandle_t *handle,
 esp_err_t ringFileIteratorPrevious(ringFileHandle_t *handle,
                                    ringFileIterator_t *iterator, void *outRecord);
 
-//-- Report the bucketId (period % capacity, the DSMRlogger-style logical
-//-- slot) of the record the cursor last returned, for diagnostics and test
+//-- Report the bucketId (period % capacity, the logical slot) of the
+//-- record the cursor last returned, for diagnostics and test
 //-- logging. Returns RING_FILE_STORE_ERR_ITER_INVALIDATED when the cursor
 //-- was invalidated by a mutation; the slot of the last successful record
 //-- is kept. A staged record (buffered mode, not yet flushed) reports
@@ -411,8 +410,8 @@ esp_err_t ringFileClear(ringFileHandle_t *handle);
 //-- ---------------------------------------------------------------------------
 //-- Timestamp helpers (usable with or without an open ring).
 //--
-//-- Time basis: the local wall clock is treated as if it were UTC
-//-- (DSMRlogger32-compatible); daylight saving time is ignored.
+//-- Time basis: the local wall clock is treated as if it were UTC;
+//-- daylight saving time is ignored.
 //--
 //-- Map a file type string to its granularity. Unknown string or NULL:
 //-- ESP_ERR_INVALID_ARG.
@@ -430,7 +429,7 @@ esp_err_t ringFileTimeStampToUsedKey(uint64_t timeStamp,
                                      ringFileGranularity_t granularity,
                                      uint64_t *outUsedKey);
 
-//-- Compute the period ("berekende waarde") of a timestamp at a
+//-- Compute the period of a timestamp at a
 //-- granularity (see ringFileGranularity_t); bucketId = period % capacity.
 //-- Same validation as ringFileTimeStampToUsedKey().
 esp_err_t ringFileTimeStampToPeriod(uint64_t timeStamp,
@@ -454,7 +453,7 @@ esp_err_t ringFileUnixToTimeStampString(uint64_t unixSeconds,
 
 //-- Compute the period value (the bucket source) for a unix timestamp:
 //-- YEAR    year
-//-- MONTH   (year - 1) * 12 + month            (DSMRlogger32 formula)
+//-- MONTH   (year - 1) * 12 + month
 //-- DAY     days since 1970-01-01
 //-- HOUR    days * 24 + hour
 //-- MINUTE  days * 1440 + hour * 60 + minute

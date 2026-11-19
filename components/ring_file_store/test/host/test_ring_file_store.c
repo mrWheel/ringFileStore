@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [5] 19-11-2026 - 13:25
+//-- FileVersion: [6] 19-11-2026 - 15:25
 //--
 //-- ringFileStore - host-side automated tests for the ring_file_store
 //-- component.
@@ -1048,7 +1048,7 @@ static void testBucketAndKeyDerivation(void)
                                       RING_FILE_GRANULARITY_YEAR, &period), ESP_OK);
   CHECK(period == 2026ULL);
 
-  //-- "YYMM": DSMRlogger32 month formula (year - 1) * 12 + month.
+  //-- "YYMM": month formula (year - 1) * 12 + month.
   CHECK_ERR(ringFileTimeStampToUsedKey(20261000000000ULL,
                                        RING_FILE_GRANULARITY_MONTH, &key), ESP_OK);
   CHECK(key == 202610ULL);
@@ -1141,7 +1141,7 @@ static void testBucketAndKeyDerivation(void)
   CHECK(periodB == periodA + 1ULL);
 
   //-- Month rolls over at the December -> January boundary with the
-  //-- DSMRlogger32 formula: (year - 1) * 12 + month counts the months of
+  //-- month formula: (year - 1) * 12 + month counts the months of
   //-- the previous years plus the index of the current month.
   CHECK_ERR(ringFileTimeStampToPeriod(20261231000000ULL,
                                       RING_FILE_GRANULARITY_MONTH, &periodA), ESP_OK);

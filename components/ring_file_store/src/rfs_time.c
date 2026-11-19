@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [3] 19-11-2026 - 13:25
+//-- FileVersion: [4] 19-11-2026 - 15:25
 //--
 //-- ringFileStore - timestamp helpers for the timestamp key model.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -12,26 +12,25 @@
 #include "rfs_time.h"
 
 //---------------------------------------------------------------------
-//-- Time basis: the local wall clock is treated as if it were UTC
-//-- (DSMRlogger32-compatible); daylight saving time is ignored. The
-//-- numeric timestamp form is the 14-digit EEYYMMDDhhmmss value with the
-//-- century fixed to "20" (years 2000-2099), back-filled with "00"
-//-- values below the file type. Period formulas ("berekende waarde",
-//-- fixed by the DSMRlogger32 baseline, days = days since 1970-01-01):
+//-- Time basis: the local wall clock is treated as if it were UTC;
+//-- daylight saving time is ignored. The numeric timestamp form is the
+//-- 14-digit EEYYMMDDhhmmss value with the century fixed to "20" (years
+//-- 2000-2099), back-filled with "00" values below the file type. Period
+//-- formulas (days = days since 1970-01-01):
 //--   YEAR    year
 //--   MONTH   (year - 1) * 12 + month
 //--   DAY     days
 //--   HOUR    days * 24 + hour
 //--   MINUTE  days * 1440 + hour * 60 + minute
 //--   SECOND  days * 86400 + hour * 3600 + minute * 60 + second
-//-- bucketId (the DSMRlogger-style logical slot) is period % capacity.
+//-- bucketId (the logical slot) is period % capacity.
 //-- "days" counts only the COMPLETE days before the date (days_from_civil
 //-- maps 1970-01-01 to 0), so a partial current period never counts as a
 //-- full unit: on day D the hourly period at 14:xx is D * 24 + 14 — the
 //-- current day contributes its completed hours only, never the full 24.
 //-- The day/minute/second formulas behave the same way. The month formula
 //-- counts the months of the previous years plus the index of the current
-//-- month (DSMRlogger32 baseline): (year - 1) * 12 + month.
+//-- month: (year - 1) * 12 + month.
 //---------------------------------------------------------------------
 
 #define RFS_TIME_SECONDS_PER_DAY 86400ull
@@ -226,7 +225,7 @@ bool rfsTimeUnixToBucketId(uint64_t unixSeconds,
       return true;
 
     case RING_FILE_GRANULARITY_MONTH:
-      //-- DSMRlogger32 month formula (before the modulo addressing).
+      //-- Month formula (before the modulo addressing).
       *outPeriod = (uint64_t)(year - 1) * 12u + (uint64_t)month;
       return true;
 
@@ -450,7 +449,7 @@ bool rfsTimeDigitsToPeriod(uint64_t timeStamp,
       return true;
 
     case RING_FILE_GRANULARITY_MONTH:
-      //-- DSMRlogger32 month formula (before the modulo addressing).
+      //-- Month formula (before the modulo addressing).
       *outPeriod = (uint64_t)(year - 1) * 12u + (uint64_t)month;
       return true;
 

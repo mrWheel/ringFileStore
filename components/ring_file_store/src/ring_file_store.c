@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [5] 19-11-2026 - 13:25
+//-- FileVersion: [6] 19-11-2026 - 15:25
 //--
 //-- ringFileStore - main ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -534,7 +534,7 @@ static int64_t rfsFileLength(int fd)
 //-- usedKey, compared as raw little-endian u64 field bytes (value equality
 //-- on the supported little-endian targets); extraction uses rfsGetU64 so
 //-- no unaligned load is ever issued. Order, eviction and resize retention
-//-- follow the period ("berekende waarde") derived from the full timestamp
+//-- follow the period derived from the full timestamp
 //-- at the file-type granularity.
 //-- ---------------------------------------------------------------------------
 
@@ -588,8 +588,8 @@ static uint64_t rfsOrderOfPending(const ringFileHandle_t *h, uint32_t p)
   return rfsOrderOfRecord(h, h->pendingRecords + (size_t)p * h->recordSize);
 }
 
-//-- Slot index reported by ringFileIteratorGetSlot(): the DSMRlogger-style
-//-- logical slot bucketId = period % capacity, and the staged marker for a
+//-- Slot index reported by ringFileIteratorGetSlot(): the logical slot
+//-- bucketId = period % capacity, and the staged marker for a
 //-- record that has not reached storage yet.
 static uint32_t rfsSlotReportOf(const ringFileHandle_t *h, const rfsMember_t *m)
 {

@@ -1,5 +1,5 @@
 <!--
- FileVersion: [4] 19-11-2026 - 15:02
+ FileVersion: [5] 19-11-2026 - 15:25
 
  ringFileStore - progress log: what was tried per session and the result.
  Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -257,7 +257,7 @@ English.
 - 09:06 — Timestamp support (TIMEBUCKET addressing) per developer design
   answers: new private module `src/rfs_time.c/.h` (Hinnant civil<->days,
   "EEYYMMDDHHMMSS" <-> unix seconds with validation, bucketId formulas
-  HOUR/DAY/WEEK-Monday/MONTH=(EEYY-1)*12+MM per DSMRlogger32, ISO-8601
+  HOUR/DAY/WEEK-Monday/MONTH=(EEYY-1)*12+MM, ISO-8601
   week helper); public API extended (ringFileAddressingMode_t,
   ringFileGranularity_t, config/open/info fields, ringFileEdit,
   ringFileTimeStampStringToUnix, ringFileUnixToTimeStampString,
@@ -294,7 +294,7 @@ English.
   the file type string ("YY".."YYMMDDhhmmss") selects the usedKey
   truncation (truncate = pad) and the bucketId source; sub-type digits
   back-fill with "00". bucketId = period % capacity with YEAR=year,
-  MONTH=(year-1)*12+month (DSMRlogger32), DAY=days-since-epoch,
+  MONTH=(year-1)*12+month, DAY=days-since-epoch,
   HOUR/MINUTE/SECOND extensions; eviction, iterators, edit window and
   resize retention follow the period. Removed u32 schemaId/schemaVersion,
   addressing modes, keyOffset/keyType/keySize/keyPositionMask and
@@ -356,8 +356,8 @@ English.
      COMPLETE days/hours/minutes/seconds (days_from_civil is exclusive:
      1970-01-01 → 0), so the current day never counts as a full 24 h —
      e.g. day D at 14:xx gives D*24+14, and 23:00 → next-day 00:00
-     advances by exactly 1. MONTH keeps the approved DSMRlogger32
-     formula (year-1)*12+month. Documented this in rfs_time.c,
+     advances by exactly 1. MONTH keeps the approved month formula
+     (year-1)*12+month. Documented this in rfs_time.c,
      ring_file_store.h and both READMEs, and added 24 explicit
      roll-over assertions to the host suite (all granularities,
      December→January, 31-12→01-01).
@@ -369,7 +369,7 @@ English.
      fixed to "FileVersion"); every .md now uses the HTML-comment block
      (root README, component README — which had a broken duplicated
      header —, test README, progressLog, projectPrompt, PUBLISHING).
-     realExample32.md left as-is: it is raw DSMR CSV example data.
+     realExample32.md left as-is: it is raw CSV example data.
      Host suite: PASS 618 checks / 0 failures. No open problems.
 
 - 14:40 — Developer reported that repeated test runs did not refresh

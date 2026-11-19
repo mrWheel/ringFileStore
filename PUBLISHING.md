@@ -46,13 +46,13 @@ After signing in to the Registry and configuring a publishing profile,
 run this from the same component directory:
 
 ```sh
-compote component upload --name ring_file_store --namespace your_namespace
+compote component upload --name ring_file_store --namespace mrWheel
 ```
 
 To install the released component from another ESP-IDF project, run:
 
 ```sh
-idf.py add-dependency "your_namespace/ring_file_store^0.1.0"
+idf.py add-dependency "mrWheel/ring_file_store^0.1.2"
 ```
 
 Use the actual namespace and release version. Keep Registry credentials

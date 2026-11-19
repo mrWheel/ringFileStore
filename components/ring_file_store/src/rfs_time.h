@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [3] 19-11-2026 - 13:25
+//-- FileVersion: [4] 19-11-2026 - 15:25
 //--
 //-- ringFileStore - internal declarations of the timestamp helpers.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -52,7 +52,7 @@ bool rfsTimeDigitsToUsedKey(uint64_t timeStamp,
                             ringFileGranularity_t granularity,
                             uint64_t *outUsedKey);
 
-//-- Period ("berekende waarde") from a validated 14-digit timestamp
+//-- Period from a validated 14-digit timestamp
 //-- (validates first). See ringFileGranularity_t for the formulas.
 bool rfsTimeDigitsToPeriod(uint64_t timeStamp,
                            ringFileGranularity_t granularity,

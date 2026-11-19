@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [13] 19-11-2026 - 12:55
+//-- FileVersion: [14] 19-11-2026 - 15:25
 //--
 //-- ringFileStore - Example application for the ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -22,7 +22,7 @@
 //-- reporting, plus a buffered-mode variant of the hourly logger showing
 //-- the coalesced commit. Every dump line shows the timeStamp, the
 //-- usedKey and the reported bucketId (period % capacity). A second ring
-//-- demonstrates the "YYMM" monthly file type (DSMRlogger32 month periods)
+//-- demonstrates the "YYMM" monthly file type (monthly periods)
 //-- and a third the "YYMMDDhhmmss" per-second file type.
 
 #include <stdio.h>
@@ -232,7 +232,7 @@ static void buildRingPath(char *out, size_t size)
            CONFIG_EXAMPLE_RING_FILE);
 }
 
-//-- "YYMMDDhh" file type: hourly buckets, DSMRlogger-style.
+//-- "YYMMDDhh" file type: hourly buckets.
 static ringFileConfig_t baseConfig(void)
 {
   ringFileConfig_t cfg;
@@ -594,7 +594,7 @@ static void demoResizeAndValidate(const char *path)
            (unsigned long)validation.badSlotCount, (int)validation.strayResizeFiles);
 }
 
-//-- "YYMM" monthly ring: periods follow the DSMRlogger32 month formula
+//-- "YYMM" monthly ring: periods follow the month formula
 //-- (year - 1) * 12 + month. A capacity of 4 shows eviction while the
 //-- year rolls over from 2026 to 2027. The month timestamps carry "00"
 //-- padding below the file type.

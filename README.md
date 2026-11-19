@@ -1,5 +1,5 @@
 <!--
- FileVersion: [4] 19-11-2026 - 13:25
+ FileVersion: [5] 19-11-2026 - 15:25
 
  ringFileStore - repository README: project overview, usage and API documentation.
  Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -72,7 +72,7 @@ components/ring_file_store/test/run_tests.sh
 
 Coverage: empty/single-slot rings, same-bucket overwrite (add of an
 active `usedKey` updates in place), `usedKey`/period/bucketId calculation
-for every file type (including the DSMRlogger32 month formula and leap
+for every file type (including the month formula and leap
 years), backfill inside and outside the retained window, not-newer
 rejection, bucket-ordered updates, iterator invalidation, file-type
 mismatch, reopen, corruption detection, resizing (including after
@@ -131,7 +131,7 @@ stored record = [ u64 timeStamp ][ u64 usedKey ][ caller payload ... ]
 * **File type (`schemaId`)** — fixed at create, one of the strings
   `"YY"`, `"YYMM"`, `"YYMMDD"`, `"YYMMDDhh"`, `"YYMMDDhhmm"`,
   `"YYMMDDhhmmss"` (case-sensitive, lower-case `hh`/`mm`/`ss`; the
-  two-digit-year DSMRlogger32 form). The stored/numeric timestamp form
+  two-digit-year form). The stored/numeric timestamp form
   always carries the century: `EEYY…`, fixed to `20` (years 2000–2099).
 * **`timeStamp` (field 1)** — the full timestamp as a numeric `uint64_t`
   in `EEYYMMDDhhmmss` form (14 digits), back-filled with `00` values
@@ -141,19 +141,19 @@ stored record = [ u64 timeStamp ][ u64 usedKey ][ caller payload ... ]
   part in the key.
 * **`usedKey` (field 2)** — the timestamp truncated to the file-type
   digits: with type `"YYMMDDhh"`, `20261118143055` yields
-  `usedKey 2026111814` (the DSMRlogger32 `YYMMDDHH` column, century
+  `usedKey 2026111814` (the `YYMMDDHH` column, century
   included). All key comparisons — duplicate-bucket detection,
   `ringFileReadByKey`, update key match, keyed iteration — compare
   `usedKey`.
 * **bucketId** — depending on the file type the component computes a
   period value from the timestamp; `bucketId = period % maxRecords` is
-  the DSMRlogger-style logical slot reported by
+  the logical slot reported by
   `ringFileIteratorGetSlot()`.
 
-  | schemaId | period ("berekende waarde") |
+  | schemaId | period |
   | --- | --- |
   | `"YY"` | year (e.g. 2026) |
-  | `"YYMM"` | `(year − 1) × 12 + month` (DSMRlogger32) |
+  | `"YYMM"` | `(year − 1) × 12 + month` |
   | `"YYMMDD"` | days since 1970-01-01 |
   | `"YYMMDDhh"` | days × 24 + hour |
   | `"YYMMDDhhmm"` | days × 1440 + hour × 60 + minute |
@@ -167,7 +167,7 @@ stored record = [ u64 timeStamp ][ u64 usedKey ][ caller payload ... ]
 
   Order, oldest/newest, eviction and resize retention follow the period.
   Physical placement stays with the crash-safe commit protocol — the
-  reported bucketId is the logical DSMR-style position.
+  reported bucketId is the logical position.
 
 The caller's record struct contains **only the payload**; the two key
 fields are added on write and delivered back on every read through the
@@ -839,7 +839,7 @@ logical ends. Each concurrent traversal gets its own cursor. A successful
 mutation on the handle invalidates existing cursors
 (`..._ERR_ITER_INVALIDATED`) — call `Begin` again. `GetSlot` reports the
 **bucketId** (`period % capacity`) of the record the cursor last returned
-— the DSMRlogger-style logical slot; a not-yet-flushed staged record
+— the logical slot; a not-yet-flushed staged record
 reports `RING_FILE_SLOT_STAGED`.
 
 **Example 1 (Setup A):**
@@ -1140,7 +1140,7 @@ uint64_t usedKey, period;
 ESP_ERROR_CHECK(ringFileTimeStampToUsedKey(20261023143055ULL, g, &usedKey));
 //-- usedKey == 202610
 ESP_ERROR_CHECK(ringFileTimeStampToPeriod(20261023143055ULL, g, &period));
-//-- period == (2026 - 1) * 12 + 10 == 24310 (DSMRlogger32 month formula)
+//-- period == (2026 - 1) * 12 + 10 == 24310 (month formula)
 
 uint32_t slot = (uint32_t)(period % 12);   //-- bucketId for capacity 12 → 10
 ```

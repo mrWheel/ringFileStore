@@ -1,5 +1,5 @@
 <!--
- FileVersion: [3] 19-11-2026 - 13:25
+ FileVersion: [4] 19-11-2026 - 15:25
 
  ringFileStore - component README: usage, binary format, commit protocol.
  Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -15,13 +15,12 @@ SD). **Every file is timestamp-keyed**: the component always prepends two
 automatic key fields — the full `timeStamp` and the derived `usedKey` — to
 the stored record, and returns them on every read. The caller never
 declares or describes a key field. "Oldest" and "newest" always mean
-bucket (period) order; the DSMRlogger32 pattern.
+bucket (period) order.
 
-The design reuses the fixed-slot storage and modulo slot addressing of
-[DSMRlogger32](https://github.com/mrWheel/DSMRlogger32) (direct offset seek
-into fixed-width history slots) and adds a versioned binary format and a
-crash-recoverable commit protocol. Legacy DSMR CSV import is not part of
-this component.
+The design follows the fixed-slot storage and modulo slot addressing
+pattern (direct offset seek into fixed-width history slots) and adds a
+versioned binary format and a crash-recoverable commit protocol. Legacy
+CSV import is not part of this component.
 
 ```c
 #include "ring_file_store.h"
@@ -63,7 +62,7 @@ ringFileClose(ring);
 Every file is created with a **file type** (`schemaId`): one of the fixed
 strings `"YY"`, `"YYMM"`, `"YYMMDD"`, `"YYMMDDhh"`, `"YYMMDDhhmm"` or
 `"YYMMDDhhmmss"` (case-sensitive, lower-case `hh`/`mm`/`ss`, the
-two-digit-year DSMRlogger32 form). Timestamps are numeric `uint64_t`
+two-digit-year form). Timestamps are numeric `uint64_t`
 values in `EEYYMMDDhhmmss` form (14 digits, century fixed `20`),
 back-filled with `00` values below the file type. The stored record is
 always:
@@ -78,15 +77,15 @@ always:
   `20261118000000` or `20261118000001` for an `"YYMMDD"` file).
 * `usedKey` (field 2) — the timestamp truncated to the file-type digits:
   type `"YYMMDDhh"`, timestamp `20261118143055` → `usedKey 2026111814`
-  (the DSMRlogger32 `YYMMDDHH` column, century included). All key
+  (the `YYMMDDHH` column, century included). All key
   comparisons use `usedKey`.
-* **bucketId** — `period % maxRecords`, the DSMRlogger-style logical slot
+* **bucketId** — `period % maxRecords`, the logical slot
   reported by `ringFileIteratorGetSlot()`:
 
-  | `schemaId` | period ("berekende waarde") | boundary |
+  | `schemaId` | period | boundary |
   | --- | --- | --- |
   | `"YY"` | year | year start |
-  | `"YYMM"` | `(year - 1) * 12 + month` | month start (DSMRlogger32; 2026-10 → 24310) |
+  | `"YYMM"` | `(year - 1) * 12 + month` | month start (2026-10 → 24310) |
   | `"YYMMDD"` | days since 1970-01-01 | midnight |
   | `"YYMMDDhh"` | days * 24 + hour | hour |
   | `"YYMMDDhhmm"` | days * 1440 + hour * 60 + minute | minute |
@@ -96,13 +95,12 @@ always:
   a partial current period never counts as a full unit: on day D the
   hourly period at 14:xx is D * 24 + 14 — the current day contributes its
   completed hours only, never the full 24 h. The month formula counts the
-  months of the previous years plus the index of the current month
-  (DSMRlogger32 baseline).
+  months of the previous years plus the index of the current month.
 
 Oldest/newest order, iteration order, eviction and resize retention all
 follow the **period**. Physical placement stays with the crash-safe commit
 protocol below (a committed slot is never overwritten in place), so the
-reported bucketId is the logical DSMR-style position, not the on-storage
+reported bucketId is the logical position, not the on-storage
 slot index.
 
 Digit validation per granularity: century `20`; month 01–12; day 01–31
@@ -146,7 +144,7 @@ locking, buffered mode and the commit protocol are mode-independent.
 | `ringFileEdit` | Backfill/edit a bucket (lost measurements). Updates the active record of the bucket, otherwise inserts it when its period lies inside the retained window. |
 | `ringFileReadOldest` / `ringFileReadNewest` | First/last record in bucket order (full record, key fields included). |
 | `ringFileIteratorBegin/Next/Previous` | Caller-owned cursors; start at oldest, newest or an exact `usedKey`; traverse either direction; `ITER_END` at the logical ends; successful mutations invalidate cursors. |
-| `ringFileIteratorGetSlot` | bucketId (`period % capacity`) of the record the cursor last returned — the DSMRlogger-style logical slot (`RING_FILE_SLOT_STAGED` for an unflushed staged record). For diagnostics and test logging. |
+| `ringFileIteratorGetSlot` | bucketId (`period % capacity`) of the record the cursor last returned — the logical slot (`RING_FILE_SLOT_STAGED` for an unflushed staged record). For diagnostics and test logging. |
 | `ringFileResize` | Change capacity through a verified candidate file plus an atomic rename switch. Shrink keeps the newest buckets that fit. Capacity ≥ 1. Persists the new capacity. |
 | `ringFileGetInfo` | count, capacity, payload size, stored record size, `schemaId`, granularity, storage size, pending count, dirty. |
 | `ringFileSync` | Commit pending buffered data and synchronize through the backend. |
@@ -154,7 +152,7 @@ locking, buffered mode and the commit protocol are mode-independent.
 | `ringFileBreakStaleLock` | Remove the `<path>.lck` lock file left by an interrupted run. Only for use right after a reset, before the first open, when no live handle can exist. |
 | `ringFileClear` | Discard all records (epoch bump in the header). File type and capacity retained. |
 | `ringFileGranularityFromSchemaId` | Map a `schemaId` string to its `ringFileGranularity_t`. |
-| `ringFileTimeStampToUsedKey` / `ringFileTimeStampToPeriod` | Compute the `usedKey` / period ("berekende waarde") of a timestamp for a granularity (validates the digits). |
+| `ringFileTimeStampToUsedKey` / `ringFileTimeStampToPeriod` | Compute the `usedKey` / period of a timestamp for a granularity (validates the digits). |
 | `ringFileTimeStampStringToUnix` / `ringFileUnixToTimeStampString` | Convert between unix seconds and the 14-digit `"EEYYMMDDHHMMSS"` string (century fixed `20`, years 2000–2099). |
 | `ringFileUnixToBucketId` | Period for a unix timestamp at a granularity (the bucket source; `period % capacity` is the bucketId). |
 | `ringFileUnixToIsoWeek` | ISO-8601 week-numbering year and week number (weeks start Monday) for display. |

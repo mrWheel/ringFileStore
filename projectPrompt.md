@@ -1,5 +1,5 @@
 <!--
- FileVersion: [3] 19-11-2026 - 13:25
+ FileVersion: [4] 19-11-2026 - 15:25
 
  ringFileStore - project prompt: requirements and rules for this project.
  Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -12,7 +12,7 @@ Implement a reusable ESP-IDF component named `ring_file_store` in readable C for
 
 ## Reference implementation
 
-Review [DSMRlogger32](https://github.com/mrWheel/DSMRlogger32/tree/main/DSMRlogger32), particularly [FSYSstuff.cpp](https://github.com/mrWheel/DSMRlogger32/blob/b9e401a090a2d0f937dcf817570d2a7970852386/DSMRlogger32/src/FSYSstuff.cpp) and [timeStuff.cpp](https://github.com/mrWheel/DSMRlogger32/blob/b9e401a090a2d0f937dcf817570d2a7970852386/DSMRlogger32/src/timeStuff.cpp). The logger stores hour, day and month history in fixed-width CSV slots. Its first column is the timestamp truncated to the file type (for an hourly file `YYMMDDHH`); the component calculates the slot from the period number modulo the configured history depth, then seeks directly to the corresponding file offset. Reuse the fixed-slot storage principle and the modulo slot addressing. The new component owns the timestamp key handling itself (see "Timestamp keys and file types") and uses its own versioned binary format. Legacy DSMR CSV import is outside this implementation.
+The design builds on the fixed-width CSV history pattern used for hour, day and month history. Its first column is the timestamp truncated to the file type (for an hourly file `YYMMDDHH`); the implementation calculates the slot from the period number modulo the configured history depth, then seeks directly to the corresponding file offset. Reuse the fixed-slot storage principle and the modulo slot addressing. The new component owns the timestamp key handling itself (see "Timestamp keys and file types") and uses its own versioned binary format. Legacy CSV import is outside this implementation.
 
 ## Timestamp keys and file types
 
@@ -24,12 +24,12 @@ Review [DSMRlogger32](https://github.com/mrWheel/DSMRlogger32/tree/main/DSMRlogg
   declares or fills the two key fields. Every read operation returns the full
   record, so both automatically added fields are delivered back to the caller
   (field 1: the complete timestamp, field 2: the `usedKey`, named after the
-  DSMRlogger32 first-column key such as `YYMMDDHH`).
+  first-column key such as `YYMMDDHH`).
 - At creation the caller supplies the VFS path, the file type as `schemaId`,
   the maximum record count and the payload record size. The `schemaId` is one
   of the fixed strings `"YY"`, `"YYMM"`, `"YYMMDD"`, `"YYMMDDhh"`,
   `"YYMMDDhhmm"` or `"YYMMDDhhmmss"` (case-sensitive, lower-case `hh`, `mm`,
-  `ss`). The two-digit year is the DSMRlogger32 form; the component stores and
+  `ss`). The two-digit year is the compact form; the component stores and
   receives timestamps in the century-padded `EEYY…` form (century fixed to
   "20", years 2000–2099).
 - Timestamps are passed and returned as numeric `uint64_t` values in
@@ -42,21 +42,21 @@ Review [DSMRlogger32](https://github.com/mrWheel/DSMRlogger32/tree/main/DSMRlogg
   digits: for an `YYMMDDhh` file the timestamp `20261118143055` has
   `usedKey 2026111814`. Key equality, duplicate-bucket detection, keyed
   reads, keyed iteration and update key matching all compare `usedKey`.
-- Depending on the file type a period value (the DSMRlogger32 "berekende
-  waarde") is calculated from the timestamp; `<periodValue> % <maxRecords>`
-  determines the bucketId, the DSMRlogger-style logical slot reported by the
+- Depending on the file type a period value is calculated from the
+  timestamp; `<periodValue> % <maxRecords>`
+  determines the bucketId, the logical slot reported by the
   iterator. The period formulas are:
   | schemaId | period |
   | --- | --- |
   | `"YY"` | year |
-  | `"YYMM"` | `(year - 1) * 12 + month` (DSMRlogger32 month formula) |
+  | `"YYMM"` | `(year - 1) * 12 + month` (month formula) |
   | `"YYMMDD"` | days since 1970-01-01 |
   | `"YYMMDDhh"` | days since 1970-01-01 * 24 + hour |
   | `"YYMMDDhhmm"` | days since 1970-01-01 * 1440 + hour * 60 + minute |
   | `"YYMMDDhhmmss"` | days since 1970-01-01 * 86400 + hour * 3600 + minute * 60 + second |
   Order, oldest/newest, eviction and resize retention follow the period
   value; the physical crash-safe slot placement stays with the commit
-  protocol (the reported bucketId is the logical DSMR-style position).
+  protocol (the reported bucketId is the logical position).
 - Use caller-owned structs for reads and writes. Payloads are stored as raw
   bytes; document that reopening requires the same payload layout, ABI and
   endianness. Use pointer-free payload structs with fixed-width fields,
