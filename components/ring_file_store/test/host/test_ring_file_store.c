@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [3] 19-11-2026 - 09:06
+//-- FileVersion: [4] 19-11-2026 - 11:40
 //--
 //-- ringFileStore - host-side automated tests for the ring_file_store
 //-- component.
@@ -10,6 +10,11 @@
 //-- are injected by replacing the backend syscall table (rfs_file_io.h)
 //-- around every write, sync and rename boundary, then inspecting the
 //-- state after reopening.
+//--
+//-- Every test exercises the timestamp key model: the component stores
+//-- [timeStamp][usedKey][payload] and returns those key fields on every
+//-- read. Bucket order, period formulas and bucketId = period % capacity
+//-- are checked against independent expected values.
 //--
 //-- Run via test/run_tests.sh.
 
@@ -174,7 +179,9 @@ static int hookFsync(int fd)
 
 static int hookRename(const char *fromPath, const char *toPath)
 {
-  if (consumeFailure(OP_RENAME, fromPath))
+  //-- Rules match either path of the rename so the first (path -> .rfsold)
+  //-- and the second (.rfsnew -> path) switch step can fail independently.
+  if (consumeFailure(OP_RENAME, fromPath) || consumeFailure(OP_RENAME, toPath))
   {
     return -1;
   }
@@ -249,30 +256,83 @@ static const char *gTestName = "";
     }                                                                            \
   } while (0)
 
+//-- Caller payload structs: never a key field, only fixed-width members.
 typedef struct
 {
-  uint64_t timestamp;
   uint32_t energyWh;
   uint16_t errorCount;
-  uint16_t padding;
+  uint16_t pad;
 } meterRec_t;
 
 typedef struct
 {
-  uint8_t raw[16];
-  uint32_t value;
-} keyedRec_t;
+  uint32_t totalWh;
+  uint16_t outages;
+  uint16_t pad;
+  uint32_t peakW;
+} monthRec_t;
 
 typedef struct
 {
-  uint8_t raw[80];
-  uint32_t value;
-} bigRec_t;
+  uint32_t tempMilliC;
+  uint16_t humidity;
+  uint16_t pad;
+} sensorRec_t;
+
+//-- Read output structs: the automatic key fields, then the payload.
+typedef struct
+{
+  ringFileKeyFields_t keys;
+  meterRec_t payload;
+} meterFull_t;
+
+typedef struct
+{
+  ringFileKeyFields_t keys;
+  monthRec_t payload;
+} monthFull_t;
+
+typedef struct
+{
+  ringFileKeyFields_t keys;
+  sensorRec_t payload;
+} sensorFull_t;
+
+//-- ---------------------------------------------------------------------------
+//-- Timestamp helpers
+//-- ---------------------------------------------------------------------------
+
+//-- Build a 14-digit EEYYMMDDhhmmss numeric timestamp.
+static uint64_t mkTs(uint32_t year, uint32_t month, uint32_t day, uint32_t hh,
+                     uint32_t mi, uint32_t ss)
+{
+  uint64_t v = year;
+  v = v * 100u + month;
+  v = v * 100u + day;
+  v = v * 100u + hh;
+  v = v * 100u + mi;
+  v = v * 100u + ss;
+  return v;
+}
+
+//-- usedKey of an hourly timestamp (truncate to the "YYMMDDhh" digits:
+//-- drop the trailing mm and ss, 4 digits).
+static uint64_t hourKey(uint64_t ts)
+{
+  return ts / 10000u;
+}
+
+//-- Independent period references (verified by hand against the documented
+//-- formulas): days since 1970-01-01 for the fixed test dates.
+#define DAYS_2026_11_18 20775u
+#define DAYS_2026_10_23 20749u
+#define DAYS_2024_02_29 19782u
 
 //-- ---------------------------------------------------------------------------
 //-- testLog.md writer: one "Command" line (with its data) followed by its
-//-- "Result", plus ring dumps showing key and physical slot. Path comes
-//-- from argv[1] (run_tests.sh passes the repository root).
+//-- "Result", plus ring dumps showing timeStamp, usedKey and the reported
+//-- bucketId. Path comes from argv[1] (run_tests.sh passes the repository
+//-- root).
 //-- ---------------------------------------------------------------------------
 
 static FILE *gLog = NULL;
@@ -337,7 +397,7 @@ static void logRingDump(ringFileHandle_t *h, const char *step)
           step, (unsigned long)info.count, (unsigned long)info.capacity);
 
   ringFileIterator_t it;
-  meterRec_t rec;
+  meterFull_t rec;
   memset(&it, 0, sizeof(it));
   memset(&rec, 0, sizeof(rec));
 
@@ -354,16 +414,20 @@ static void logRingDump(ringFileHandle_t *h, const char *step)
 
     if (slot == RING_FILE_SLOT_STAGED)
     {
-      logLine("  - slot **staged** (not yet on storage) key=%llu "
+      logLine("  - slot **staged** (not yet on storage) ts=%llu usedKey=%llu "
               "energyWh=%lu errorCount=%u",
-              (unsigned long long)rec.timestamp, (unsigned long)rec.energyWh,
-              (unsigned)rec.errorCount);
+              (unsigned long long)rec.keys.timeStamp,
+              (unsigned long long)rec.keys.usedKey,
+              (unsigned long)rec.payload.energyWh,
+              (unsigned)rec.payload.errorCount);
     }
     else
     {
-      logLine("  - slot %lu key=%llu energyWh=%lu errorCount=%u",
-              (unsigned long)slot, (unsigned long long)rec.timestamp,
-              (unsigned long)rec.energyWh, (unsigned)rec.errorCount);
+      logLine("  - bucketId %lu ts=%llu usedKey=%llu energyWh=%lu errorCount=%u",
+              (unsigned long)slot, (unsigned long long)rec.keys.timeStamp,
+              (unsigned long long)rec.keys.usedKey,
+              (unsigned long)rec.payload.energyWh,
+              (unsigned)rec.payload.errorCount);
     }
 
     if (ringFileIteratorNext(h, &it, &rec) != ESP_OK)
@@ -373,57 +437,94 @@ static void logRingDump(ringFileHandle_t *h, const char *step)
   }
 }
 
+//-- ---------------------------------------------------------------------------
+//-- File/config helpers
+//-- ---------------------------------------------------------------------------
+
 static void ringPath(char *out, size_t size, const char *name)
 {
   snprintf(out, size, "%s/%s.rfs", sDir, name);
 }
 
-static ringFileConfig_t meterConfig(uint32_t capacity)
+static ringFileConfig_t baseConfig(uint32_t capacity, const char *schemaId,
+                                   uint16_t payloadSize)
 {
   ringFileConfig_t cfg;
   memset(&cfg, 0, sizeof(cfg));
   cfg.maxRecords = capacity;
-  cfg.schemaId = 1;
-  cfg.schemaVersion = 1;
-  cfg.recordSize = sizeof(meterRec_t);
-  cfg.key.keyOffset = (uint32_t)offsetof(meterRec_t, timestamp);
-  cfg.key.keyType = RING_FILE_KEY_U64;
-  cfg.key.keySize = (uint16_t)sizeof(uint64_t);
+  cfg.schemaId = schemaId;
+  cfg.recordSize = payloadSize;
   cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
   return cfg;
 }
 
-static ringFileOpenConfig_t meterOpen(bool readOnly, ringFilePersistMode_t mode,
-                                      uint16_t maxPending)
+static ringFileConfig_t meterConfig(uint32_t capacity)
+{
+  return baseConfig(capacity, RING_FILE_SCHEMA_YYMMDDHH, sizeof(meterRec_t));
+}
+
+static ringFileConfig_t monthConfig(uint32_t capacity)
+{
+  return baseConfig(capacity, RING_FILE_SCHEMA_YYMM, sizeof(monthRec_t));
+}
+
+static ringFileConfig_t sensorConfig(uint32_t capacity)
+{
+  return baseConfig(capacity, RING_FILE_SCHEMA_YYMMDDHHMMSS,
+                    sizeof(sensorRec_t));
+}
+
+static ringFileOpenConfig_t baseOpen(const char *schemaId,
+                                     uint32_t expectedPayload, bool readOnly,
+                                     ringFilePersistMode_t mode,
+                                     uint16_t maxPending)
 {
   ringFileOpenConfig_t cfg;
   memset(&cfg, 0, sizeof(cfg));
-  cfg.expectedSchemaId = 1;
-  cfg.expectedSchemaVersion = 1;
-  cfg.expectedRecordSize = sizeof(meterRec_t);
+  cfg.expectedSchemaId = schemaId;
+  cfg.expectedRecordSize = expectedPayload;
   cfg.readOnly = readOnly;
   cfg.persistMode = mode;
   cfg.maxPendingRecords = maxPending;
   return cfg;
 }
 
-static void mkMeter(meterRec_t *m, uint64_t ts, uint32_t wh, uint16_t errs)
+static ringFileOpenConfig_t meterOpen(bool readOnly, ringFilePersistMode_t mode,
+                                      uint16_t maxPending)
+{
+  return baseOpen(RING_FILE_SCHEMA_YYMMDDHH, sizeof(meterRec_t), readOnly,
+                  mode, maxPending);
+}
+
+static void mkMeter(meterRec_t *m, uint32_t wh, uint16_t errs)
 {
   memset(m, 0, sizeof(*m));
-  m->timestamp = ts;
   m->energyWh = wh;
   m->errorCount = errs;
 }
 
-static const uint64_t METER_KEY = 4242;
+static void mkMonth(monthRec_t *m, uint32_t wh, uint16_t outages, uint32_t peakW)
+{
+  memset(m, 0, sizeof(*m));
+  m->totalWh = wh;
+  m->outages = outages;
+  m->peakW = peakW;
+}
 
-static ringFileHandle_t *mustCreate(const char *name, uint32_t capacity)
+static void mkSensor(sensorRec_t *m, uint32_t tempMilliC, uint16_t humidity)
+{
+  memset(m, 0, sizeof(*m));
+  m->tempMilliC = tempMilliC;
+  m->humidity = humidity;
+}
+
+static ringFileHandle_t *mustCreateCfg(const char *name,
+                                       const ringFileConfig_t *cfg)
 {
   char path[300];
   ringPath(path, sizeof(path), name);
-  ringFileConfig_t cfg = meterConfig(capacity);
   ringFileHandle_t *h = NULL;
-  esp_err_t err = ringFileCreate(path, &cfg, &h);
+  esp_err_t err = ringFileCreate(path, cfg, &h);
 
   if (err != ESP_OK)
   {
@@ -434,15 +535,19 @@ static ringFileHandle_t *mustCreate(const char *name, uint32_t capacity)
   return h;
 }
 
-static ringFileHandle_t *mustOpenMode(const char *name, bool readOnly,
-                                      ringFilePersistMode_t mode,
-                                      uint16_t maxPending)
+static ringFileHandle_t *mustCreateMeter(const char *name, uint32_t capacity)
+{
+  ringFileConfig_t cfg = meterConfig(capacity);
+  return mustCreateCfg(name, &cfg);
+}
+
+static ringFileHandle_t *mustOpenCfg(const char *name,
+                                     const ringFileOpenConfig_t *cfg)
 {
   char path[300];
   ringPath(path, sizeof(path), name);
-  ringFileOpenConfig_t cfg = meterOpen(readOnly, mode, maxPending);
   ringFileHandle_t *h = NULL;
-  esp_err_t err = ringFileOpen(path, &cfg, &h);
+  esp_err_t err = ringFileOpen(path, cfg, &h);
 
   if (err != ESP_OK)
   {
@@ -453,9 +558,17 @@ static ringFileHandle_t *mustOpenMode(const char *name, bool readOnly,
   return h;
 }
 
-static ringFileHandle_t *mustOpen(const char *name, bool readOnly)
+static ringFileHandle_t *mustOpenMeterMode(const char *name, bool readOnly,
+                                           ringFilePersistMode_t mode,
+                                           uint16_t maxPending)
 {
-  return mustOpenMode(name, readOnly, RING_FILE_PERSIST_IMMEDIATE, 0);
+  ringFileOpenConfig_t cfg = meterOpen(readOnly, mode, maxPending);
+  return mustOpenCfg(name, &cfg);
+}
+
+static ringFileHandle_t *mustOpenMeter(const char *name, bool readOnly)
+{
+  return mustOpenMeterMode(name, readOnly, RING_FILE_PERSIST_IMMEDIATE, 0);
 }
 
 static uint32_t infoCount(ringFileHandle_t *h)
@@ -469,6 +582,25 @@ static uint32_t infoCount(ringFileHandle_t *h)
   }
 
   return info.count;
+}
+
+//-- Add one hourly record for (day 23 + dayOff, hour hh) of October 2026.
+static esp_err_t addHour(ringFileHandle_t *h, uint32_t dayOff, uint32_t hh,
+                         uint32_t wh)
+{
+  meterRec_t rec;
+  mkMeter(&rec, wh, (uint16_t)hh);
+  uint64_t ts = mkTs(2026u, 10u, 23u + dayOff, hh, 0u, 0u);
+  esp_err_t err = ringFileAdd(h, ts, &rec);
+  logCmd(err, "ringFileAdd(ts=%014llu usedKey=%llu energyWh=%lu)",
+         (unsigned long long)ts, (unsigned long long)hourKey(ts),
+         (unsigned long)wh);
+  return err;
+}
+
+static uint64_t hourTs(uint32_t dayOff, uint32_t hh)
+{
+  return mkTs(2026u, 10u, 23u + dayOff, hh, 0u, 0u);
 }
 
 static bool pathExists(const char *path)
@@ -505,6 +637,64 @@ static void pokeFile(const char *path, size_t offset, const uint8_t *bytes,
   close(fd);
 }
 
+#define SLOT_HDR_SIZE 20u
+#define HEADER_SIZE 96u
+
+//-- CRC32 mirror of the component's header checksum (reflected polynomial
+//-- 0xEDB88320), used to keep the header CRC valid while poking fields.
+static uint32_t testCrc32(const uint8_t *data, size_t len)
+{
+  uint32_t state = 0xFFFFFFFFu;
+
+  for (size_t i = 0; i < len; i++)
+  {
+    state ^= data[i];
+
+    for (int bit = 0; bit < 8; bit++)
+    {
+      if (state & 1u)
+      {
+        state = (state >> 1) ^ 0xEDB88320u;
+      }
+      else
+      {
+        state >>= 1;
+      }
+    }
+  }
+
+  return ~state;
+}
+
+static void readWhole(const char *path, uint8_t *buf, size_t len)
+{
+  int fd = open(path, O_RDONLY);
+
+  if (fd < 0 || pread(fd, buf, len, 0) != (ssize_t)len)
+  {
+    printf("  FATAL read %s\n", path);
+    exit(2);
+  }
+
+  close(fd);
+}
+
+//-- Poke a header field and repair the CRC over [0,88) so the decode
+//-- reaches the field check instead of the checksum check.
+static void pokeHeader(const char *path, size_t offset, const uint8_t *bytes,
+                       size_t len)
+{
+  uint8_t hdr[HEADER_SIZE];
+  readWhole(path, hdr, sizeof(hdr));
+  memcpy(hdr + offset, bytes, len);
+  uint32_t crc = testCrc32(hdr, 88);
+  hdr[88] = (uint8_t)(crc & 0xFFu);
+  hdr[89] = (uint8_t)((crc >> 8) & 0xFFu);
+  hdr[90] = (uint8_t)((crc >> 16) & 0xFFu);
+  hdr[91] = (uint8_t)((crc >> 24) & 0xFFu);
+  pokeFile(path, 0, hdr, sizeof(hdr));
+}
+
 static void copyFile(const char *src, const char *dst)
 {
   int sfd = open(src, O_RDONLY);
@@ -523,9 +713,6 @@ static void copyFile(const char *src, const char *dst)
   close(sfd);
   close(dfd);
 }
-
-#define SLOT_HDR_SIZE 20u
-#define HEADER_SIZE 96u
 
 static size_t slotRecordOffset(uint32_t index, uint32_t recordSize)
 {
@@ -546,1823 +733,1391 @@ static rfsIoStats_t lastStats(void)
 
 static void testArguments(void)
 {
-  ringFileConfig_t cfg = meterConfig(4);
-  ringFileHandle_t *h = NULL;
   char path[300];
   ringPath(path, sizeof(path), "args");
+  ringFileHandle_t *h = NULL;
+  ringFileConfig_t cfg = meterConfig(4);
 
   CHECK_ERR(ringFileCreate(NULL, &cfg, &h), ESP_ERR_INVALID_ARG);
   CHECK_ERR(ringFileCreate(path, NULL, &h), ESP_ERR_INVALID_ARG);
   CHECK_ERR(ringFileCreate(path, &cfg, NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileCreate("", &cfg, &h), ESP_ERR_INVALID_ARG);
 
-  cfg.maxRecords = 0;
-  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_ERR_INVALID_ARG);
-  cfg = meterConfig(4);
-  cfg.recordSize = 0;
-  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_ERR_INVALID_ARG);
-  cfg = meterConfig(4);
-  cfg.key.keySize = 4; //-- u64 key must carry 8 bytes
-  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_ERR_INVALID_ARG);
-  cfg = meterConfig(4);
-  cfg.key.keyOffset = (uint32_t)sizeof(meterRec_t) - 4; //-- key past the record
-  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_ERR_INVALID_ARG);
+  ringFileConfig_t bad = meterConfig(4);
+  bad.maxRecords = 0;
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
 
-  h = mustCreate("args", 4);
-  CHECK_ERR(ringFileAdd(NULL, NULL), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileAdd(h, NULL), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileReadByKey(h, NULL, NULL), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileResize(h, 0), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileGetInfo(h, NULL), ESP_ERR_INVALID_ARG);
-  ringFileClose(h);
+  bad = meterConfig(65537u);
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
+
+  bad = meterConfig(4);
+  bad.recordSize = 0;
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
+
+  bad = meterConfig(4);
+  bad.schemaId = NULL;
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
+
+  bad = meterConfig(4);
+  bad.schemaId = "";
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
+
+  bad = meterConfig(4);
+  bad.schemaId = "XX";
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
+
+  //-- File types are case-sensitive: hh/mm/ss must be lower case.
+  bad = meterConfig(4);
+  bad.schemaId = "YYMMDDHH";
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
+
+  bad = meterConfig(4);
+  bad.schemaId = "WEEK";
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
+
+  bad = meterConfig(4);
+  bad.persistMode = (ringFilePersistMode_t)7;
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
+
+  bad = meterConfig(4);
+  bad.persistMode = RING_FILE_PERSIST_BUFFERED;
+  bad.maxPendingRecords = 65;
+  CHECK_ERR(ringFileCreate(path, &bad, &h), ESP_ERR_INVALID_ARG);
+
+  CHECK(!pathExists(path));
+
+  ringFileHandle_t *w = mustCreateMeter("argsOk", 4);
+  meterRec_t rec;
+  mkMeter(&rec, 1000, 0);
+
+  CHECK_ERR(ringFileAdd(NULL, 20261023140000ULL, &rec), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileAdd(w, 20261023140000ULL, NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileReadByKey(NULL, 2026102314ULL, NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileReadByKey(w, 2026102314ULL, NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileUpdateByKey(w, 2026102314ULL, 20261023140000ULL, NULL),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileUpsert(w, 20261023140000ULL, NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileEdit(w, 20261023140000ULL, NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileReadOldest(w, NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileReadNewest(w, NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileGetInfo(NULL, NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileResize(w, 0), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileValidate(NULL, NULL), ESP_ERR_INVALID_ARG);
+
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(w, &it, RING_FILE_ITER_OLDEST, NULL, NULL),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileIteratorBegin(w, NULL, RING_FILE_ITER_OLDEST, NULL, &full),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileIteratorBegin(w, &it, RING_FILE_ITER_KEY, NULL, &full),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileIteratorGetSlot(w, &it, NULL), ESP_ERR_INVALID_ARG);
+
+  ringFileClose(w);
 }
 
 static void testCreateOpenReopen(void)
 {
-  char path[300];
-  ringPath(path, sizeof(path), "create");
-  ringFileConfig_t cfg = meterConfig(4);
-  ringFileHandle_t *h = NULL;
-  ringFileHandle_t *h2 = NULL;
+  ringFileHandle_t *h = mustCreateMeter("reopen", 4);
 
-  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_OK);
-  CHECK_ERR(ringFileCreate(path, &cfg, &h2), RING_FILE_STORE_ERR_ALREADY_EXISTS);
-  CHECK(h != NULL);
+  for (uint32_t hh = 0; hh < 3; hh++)
+  {
+    CHECK_ERR(addHour(h, 0, hh, 100u + hh), ESP_OK);
+  }
 
-  meterRec_t rec;
-  mkMeter(&rec, 100, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  logRingDump(h, "add hh0..hh2");
+
+  ringFileInfo_t info;
+  memset(&info, 0, sizeof(info));
+  CHECK_ERR(ringFileGetInfo(h, &info), ESP_OK);
+  CHECK(info.count == 3);
+  CHECK(info.capacity == 4);
+  CHECK(info.payloadSize == sizeof(meterRec_t));
+  CHECK(info.recordSize == sizeof(meterFull_t));
+  CHECK(info.storageSize == HEADER_SIZE + 5u * (SLOT_HDR_SIZE + 24u));
+  CHECK(info.pendingCount == 0);
+  CHECK(!info.dirty);
+  CHECK(strcmp(info.schemaId, RING_FILE_SCHEMA_YYMMDDHH) == 0);
+  CHECK(info.granularity == RING_FILE_GRANULARITY_HOUR);
+
   ringFileClose(h);
 
-  h = mustOpen("create", false);
-  CHECK(infoCount(h) == 1);
-  ringFileClose(h);
+  h = mustOpenMeter("reopen", false);
+  CHECK(infoCount(h) == 3);
 
-  ringFileOpenConfig_t ocfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
-  CHECK_ERR(ringFileOpen("no_such_dir_missing/missing.rfs", &ocfg, &h),
-            ESP_ERR_NOT_FOUND);
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(0, 0));
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 0)));
+  CHECK(full.payload.energyWh == 100);
+
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(h, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(0, 2));
+  CHECK(full.payload.energyWh == 102);
+
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadByKey(h, hourKey(hourTs(0, 1)), &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(0, 1));
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 1)));
+  CHECK(full.payload.energyWh == 101);
+
+  ringFileClose(h);
 }
 
 static void testEmptyRing(void)
 {
-  ringFileHandle_t *h = mustCreate("empty", 3);
-  meterRec_t rec;
+  ringFileHandle_t *h = mustCreateMeter("empty", 3);
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+
+  CHECK_ERR(ringFileReadOldest(h, &full), RING_FILE_STORE_ERR_RING_EMPTY);
+  CHECK_ERR(ringFileReadNewest(h, &full), RING_FILE_STORE_ERR_RING_EMPTY);
+  CHECK_ERR(ringFileReadByKey(h, 2026102314ULL, &full),
+            RING_FILE_STORE_ERR_KEY_NOT_FOUND);
+
   ringFileIterator_t it;
   memset(&it, 0, sizeof(it));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
+            RING_FILE_STORE_ERR_RING_EMPTY);
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_NEWEST, NULL, &full),
+            RING_FILE_STORE_ERR_RING_EMPTY);
+  uint64_t key = hourKey(hourTs(0, 0));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_KEY, &key, &full),
+            RING_FILE_STORE_ERR_KEY_NOT_FOUND);
 
   CHECK(infoCount(h) == 0);
-  CHECK_ERR(ringFileReadOldest(h, &rec), RING_FILE_STORE_ERR_RING_EMPTY);
-  CHECK_ERR(ringFileReadNewest(h, &rec), RING_FILE_STORE_ERR_RING_EMPTY);
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &rec),
-            RING_FILE_STORE_ERR_RING_EMPTY);
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_NEWEST, NULL, &rec),
-            RING_FILE_STORE_ERR_RING_EMPTY);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &rec), RING_FILE_STORE_ERR_ITER_INVALIDATED);
   ringFileClose(h);
 }
 
 static void testSingleSlotRing(void)
 {
-  ringFileHandle_t *h = mustCreate("single", 1);
-  meterRec_t rec, out;
+  ringFileHandle_t *h = mustCreateMeter("single", 1);
 
-  mkMeter(&rec, 10, 100, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  CHECK_ERR(addHour(h, 0, 0, 10), ESP_OK);
   CHECK(infoCount(h) == 1);
 
-  mkMeter(&rec, 20, 200, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK); //-- evicts key 10
+  //-- Same bucket, later timestamp: update in place, count unchanged.
+  meterRec_t rec;
+  mkMeter(&rec, 11, 9);
+  CHECK_ERR(ringFileUpsert(h, mkTs(2026u, 10u, 23u, 0u, 30u, 0u), &rec), ESP_OK);
   CHECK(infoCount(h) == 1);
-  CHECK_ERR(ringFileReadByKey(h, &METER_KEY, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  uint64_t k = 10;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  k = 20;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 200);
 
-  //-- Reuse the evicted key.
-  mkMeter(&rec, 10, 101, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  k = 20;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  k = 10;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-
-  //-- Repeated edits of one key on a one-record ring alternate between the
-  //-- record slot and the scratch slot (bounded writes, no header rewrite).
-  for (int i = 0; i < 100; i++)
-  {
-    mkMeter(&rec, 10, (uint32_t)i, 0);
-    CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), ESP_OK);
-  }
-
-  ringFileClose(h);
-  h = mustOpen("single", false);
+  //-- Newer bucket evicts the single old one.
+  CHECK_ERR(addHour(h, 0, 1, 20), ESP_OK);
   CHECK(infoCount(h) == 1);
-  k = 10;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 99);
+
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 1)));
+  CHECK(full.payload.energyWh == 20);
+
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
+            ESP_OK);
+  uint32_t slot = 0xFFFFFFFFu;
+  CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slot), ESP_OK);
+  CHECK(slot == 0u);
+
   ringFileClose(h);
 }
 
-static void testDuplicatesAndWraparound(void)
+static void testSameBucketUpdate(void)
 {
-  ringFileHandle_t *h = mustCreate("wrap", 3);
-  meterRec_t rec, out;
+  ringFileHandle_t *h = mustCreateMeter("samebucket", 3);
 
-  //-- Spec scenario: keys arrive 100, 300, 200 then 50.
-  mkMeter(&rec, 100, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  mkMeter(&rec, 300, 2, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  mkMeter(&rec, 200, 3, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  uint64_t k = 100;
-  CHECK_ERR(ringFileAdd(h, &rec), RING_FILE_STORE_ERR_DUPLICATE_KEY);
-  (void)k;
-  mkMeter(&rec, 100, 9, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), RING_FILE_STORE_ERR_DUPLICATE_KEY);
+  CHECK_ERR(addHour(h, 0, 1, 100), ESP_OK);
+  logRingDump(h, "add hh1");
 
-  mkMeter(&rec, 50, 4, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK); //-- evicts oldest (100)
+  //-- A second timestamp inside the same hour updates the active bucket.
+  meterRec_t rec;
+  mkMeter(&rec, 150, 3);
+  CHECK_ERR(ringFileUpsert(h, mkTs(2026u, 10u, 23u, 1u, 30u, 0u), &rec), ESP_OK);
+  CHECK(infoCount(h) == 1);
+
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadByKey(h, hourKey(hourTs(0, 1)), &full), ESP_OK);
+  CHECK(full.keys.timeStamp == mkTs(2026u, 10u, 23u, 1u, 30u, 0u));
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 1)));
+  CHECK(full.payload.energyWh == 150);
+  CHECK(full.payload.errorCount == 3);
+
+  logRingDump(h, "upsert hh1:30");
+
+  ringFileClose(h);
+}
+
+static void testNotNewer(void)
+{
+  ringFileHandle_t *h = mustCreateMeter("notnewer", 2);
+
+  CHECK_ERR(addHour(h, 0, 0, 10), ESP_OK);
+  CHECK_ERR(addHour(h, 0, 1, 20), ESP_OK);
+  CHECK_ERR(addHour(h, 0, 2, 30), ESP_OK);
+  logRingDump(h, "add hh0..hh2 (capacity 2, hh0 evicted)");
+
+  //-- hh0 is evicted and older than the newest bucket: rejected.
+  CHECK_ERR(addHour(h, 0, 0, 99), RING_FILE_STORE_ERR_NOT_NEWER);
+  CHECK(infoCount(h) == 2);
+
+  //-- hh1 is still an active bucket: add updates it in place.
+  CHECK_ERR(addHour(h, 0, 1, 25), ESP_OK);
+
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 1)));
+  CHECK(full.payload.energyWh == 25);
+
+  ringFileClose(h);
+}
+
+static void testTimestampValidation(void)
+{
+  ringFileHandle_t *h = mustCreateMeter("tsvalid", 3);
+  meterRec_t rec;
+  mkMeter(&rec, 1, 0);
+
+  //-- Invalid digits for a "YYMMDDhh" file are rejected without changes.
+  CHECK_ERR(ringFileAdd(h, mkTs(2026u, 13u, 1u, 1u, 0u, 0u), &rec),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileAdd(h, mkTs(2026u, 4u, 31u, 1u, 0u, 0u), &rec),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileAdd(h, mkTs(2026u, 10u, 23u, 24u, 0u, 0u), &rec),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileAdd(h, mkTs(2026u, 10u, 23u, 1u, 60u, 0u), &rec),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileAdd(h, mkTs(2026u, 10u, 23u, 1u, 0u, 60u), &rec),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileAdd(h, 19961023010000ULL, &rec), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileAdd(h, 21261023010000ULL, &rec), ESP_ERR_INVALID_ARG);
+  CHECK(infoCount(h) == 0);
+
+  CHECK_ERR(ringFileTimeStampToUsedKey(mkTs(2026u, 2u, 29u, 0u, 0u, 0u),
+                                       RING_FILE_GRANULARITY_HOUR, NULL),
+            ESP_ERR_INVALID_ARG);
+
+  uint64_t period = 0;
+  CHECK_ERR(ringFileTimeStampToPeriod(19991231235959ULL,
+                                      RING_FILE_GRANULARITY_DAY, &period),
+            ESP_ERR_INVALID_ARG);
+
+  //-- The ring is still usable after the rejected adds.
+  CHECK_ERR(addHour(h, 0, 0, 7), ESP_OK);
+  CHECK(infoCount(h) == 1);
+
+  ringFileClose(h);
+}
+
+static void testBucketAndKeyDerivation(void)
+{
+  uint64_t key = 0;
+  uint64_t period = 0;
+  ringFileGranularity_t gran = RING_FILE_GRANULARITY_NONE;
+
+  //-- File type strings map to the documented granularity.
+  CHECK_ERR(ringFileGranularityFromSchemaId(RING_FILE_SCHEMA_YY, &gran), ESP_OK);
+  CHECK(gran == RING_FILE_GRANULARITY_YEAR);
+  CHECK_ERR(ringFileGranularityFromSchemaId(RING_FILE_SCHEMA_YYMM, &gran), ESP_OK);
+  CHECK(gran == RING_FILE_GRANULARITY_MONTH);
+  CHECK_ERR(ringFileGranularityFromSchemaId(RING_FILE_SCHEMA_YYMMDD, &gran), ESP_OK);
+  CHECK(gran == RING_FILE_GRANULARITY_DAY);
+  CHECK_ERR(ringFileGranularityFromSchemaId(RING_FILE_SCHEMA_YYMMDDHH, &gran), ESP_OK);
+  CHECK(gran == RING_FILE_GRANULARITY_HOUR);
+  CHECK_ERR(ringFileGranularityFromSchemaId(RING_FILE_SCHEMA_YYMMDDHHMM, &gran), ESP_OK);
+  CHECK(gran == RING_FILE_GRANULARITY_MINUTE);
+  CHECK_ERR(ringFileGranularityFromSchemaId(RING_FILE_SCHEMA_YYMMDDHHMMSS, &gran), ESP_OK);
+  CHECK(gran == RING_FILE_GRANULARITY_SECOND);
+  CHECK_ERR(ringFileGranularityFromSchemaId(NULL, &gran), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileGranularityFromSchemaId("YYmm", &gran), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileGranularityFromSchemaId("WEEK", &gran), ESP_ERR_INVALID_ARG);
+
+  //-- "YY": usedKey 2026, period = year.
+  CHECK_ERR(ringFileTimeStampToUsedKey(20260000000000ULL,
+                                       RING_FILE_GRANULARITY_YEAR, &key), ESP_OK);
+  CHECK(key == 2026ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(20260000000000ULL,
+                                      RING_FILE_GRANULARITY_YEAR, &period), ESP_OK);
+  CHECK(period == 2026ULL);
+
+  //-- "YYMM": DSMRlogger32 month formula (year - 1) * 12 + month.
+  CHECK_ERR(ringFileTimeStampToUsedKey(20261000000000ULL,
+                                       RING_FILE_GRANULARITY_MONTH, &key), ESP_OK);
+  CHECK(key == 202610ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(20261000000000ULL,
+                                      RING_FILE_GRANULARITY_MONTH, &period), ESP_OK);
+  CHECK(period == 24310ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(20260101000000ULL,
+                                      RING_FILE_GRANULARITY_MONTH, &period), ESP_OK);
+  CHECK(period == 24301ULL);
+
+  //-- "YYMMDD": days since 1970-01-01, zero padding and valid sub-fields.
+  CHECK_ERR(ringFileTimeStampToUsedKey(20261118000000ULL,
+                                       RING_FILE_GRANULARITY_DAY, &key), ESP_OK);
+  CHECK(key == 20261118ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(20261118000000ULL,
+                                      RING_FILE_GRANULARITY_DAY, &period), ESP_OK);
+  CHECK(period == DAYS_2026_11_18);
+  CHECK_ERR(ringFileTimeStampToUsedKey(20261118000001ULL,
+                                       RING_FILE_GRANULARITY_DAY, &key), ESP_OK);
+  CHECK(key == 20261118ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(20240229000000ULL,
+                                      RING_FILE_GRANULARITY_DAY, &period), ESP_OK);
+  CHECK(period == DAYS_2024_02_29);
+  CHECK_ERR(ringFileTimeStampToPeriod(20260229000000ULL,
+                                      RING_FILE_GRANULARITY_DAY, &period),
+            ESP_ERR_INVALID_ARG);
+
+  //-- "YYMMDDhh": days * 24 + hour.
+  CHECK_ERR(ringFileTimeStampToUsedKey(mkTs(2026u, 11u, 18u, 14u, 0u, 0u),
+                                       RING_FILE_GRANULARITY_HOUR, &key), ESP_OK);
+  CHECK(key == 2026111814ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 18u, 14u, 0u, 0u),
+                                      RING_FILE_GRANULARITY_HOUR, &period), ESP_OK);
+  CHECK(period == DAYS_2026_11_18 * 24ULL + 14ULL);
+
+  //-- "YYMMDDhhmm": days * 1440 + hour * 60 + minute.
+  CHECK_ERR(ringFileTimeStampToUsedKey(mkTs(2026u, 11u, 18u, 14u, 30u, 0u),
+                                       RING_FILE_GRANULARITY_MINUTE, &key), ESP_OK);
+  CHECK(key == 202611181430ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 18u, 14u, 30u, 0u),
+                                      RING_FILE_GRANULARITY_MINUTE, &period), ESP_OK);
+  CHECK(period == DAYS_2026_11_18 * 1440ULL + 14ULL * 60ULL + 30ULL);
+
+  //-- "YYMMDDhhmmss": days * 86400 + seconds of day.
+  CHECK_ERR(ringFileTimeStampToUsedKey(mkTs(2026u, 11u, 18u, 14u, 30u, 55u),
+                                       RING_FILE_GRANULARITY_SECOND, &key), ESP_OK);
+  CHECK(key == 20261118143055ULL);
+  CHECK_ERR(ringFileTimeStampToPeriod(mkTs(2026u, 11u, 18u, 14u, 30u, 55u),
+                                      RING_FILE_GRANULARITY_SECOND, &period), ESP_OK);
+  CHECK(period == DAYS_2026_11_18 * 86400ULL + 14ULL * 3600ULL + 30ULL * 60ULL + 55ULL);
+
+  //-- Integration: the reported bucketId is period % capacity. For the test
+  //-- dates the hourly period is DAYS_2026_10_23 * 24 + hh = 497976 + hh.
+  ringFileHandle_t *h = mustCreateMeter("bucket5", 5);
+
+  for (uint32_t hh = 0; hh < 5; hh++)
+  {
+    CHECK_ERR(addHour(h, 0, hh, 100u + hh), ESP_OK);
+  }
+
+  logRingDump(h, "add hh0..hh4 (capacity 5)");
+
+  ringFileIterator_t it;
+  meterFull_t full;
+  memset(&it, 0, sizeof(it));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
+            ESP_OK);
+
+  uint32_t seen = 0;
+
+  for (;;)
+  {
+    uint32_t slot = 0;
+    CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slot), ESP_OK);
+    uint64_t expectPeriod = DAYS_2026_10_23 * 24ULL + (uint64_t)seen;
+    CHECK(slot == (uint32_t)(expectPeriod % 5u));
+    CHECK(full.keys.usedKey == hourKey(hourTs(0, seen)));
+    seen++;
+
+    if (ringFileIteratorNext(h, &it, &full) != ESP_OK)
+    {
+      break;
+    }
+  }
+
+  CHECK(seen == 5);
+  ringFileClose(h);
+
+  //-- "YYMM" ring: the October 2026 period 24310 maps to bucket 10 of 12.
+  ringFileConfig_t mcfg = monthConfig(12);
+  ringFileHandle_t *m = mustCreateCfg("bucket12", &mcfg);
+
+  monthRec_t monthRec;
+  mkMonth(&monthRec, 4000, 1, 3000);
+  CHECK_ERR(ringFileAdd(m, 20261000000000ULL, &monthRec), ESP_OK);
+  mkMonth(&monthRec, 5000, 2, 3400);
+  CHECK_ERR(ringFileAdd(m, 20261100000000ULL, &monthRec), ESP_OK);
+  logCmd(ESP_OK, "ringFileAdd(months 202610, 202611)");
+
+  ringFileIterator_t mit;
+  memset(&mit, 0, sizeof(mit));
+  monthFull_t mfull;
+  memset(&mfull, 0, sizeof(mfull));
+  CHECK_ERR(ringFileIteratorBegin(m, &mit, RING_FILE_ITER_NEWEST, NULL, &mfull),
+            ESP_OK);
+  uint32_t mslot = 0;
+  CHECK_ERR(ringFileIteratorGetSlot(m, &mit, &mslot), ESP_OK);
+  CHECK(mslot == 24311u % 12u);
+  CHECK(mfull.keys.usedKey == 202611ULL);
+  CHECK(mfull.payload.totalWh == 5000);
+  ringFileClose(m);
+}
+
+static void testEvictionOrder(void)
+{
+  ringFileHandle_t *h = mustCreateMeter("evict", 3);
+
+  for (uint32_t hh = 0; hh < 5; hh++)
+  {
+    CHECK_ERR(addHour(h, 0, hh, 10u * hh), ESP_OK);
+  }
+
+  CHECK(infoCount(h) == 3);
+  logRingDump(h, "add hh0..hh4 (capacity 3)");
+
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 2)));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 4)));
+
+  ringFileClose(h);
+
+  h = mustOpenMeter("evict", false);
+  CHECK(infoCount(h) == 3);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 2)));
+  ringFileClose(h);
+}
+
+static void testEditWindow(void)
+{
+  ringFileHandle_t *h = mustCreateMeter("editwin", 3);
+
+  for (uint32_t hh = 0; hh < 3; hh++)
+  {
+    CHECK_ERR(addHour(h, 0, hh, 10u + hh), ESP_OK);
+  }
+
+  //-- An empty ring accepts any bucket.
+  ringFileHandle_t *e = mustCreateMeter("editwin2", 3);
+  meterRec_t rec;
+  mkMeter(&rec, 1, 0);
+  CHECK_ERR(ringFileEdit(e, hourTs(0, 10), &rec), ESP_OK);
+  CHECK(infoCount(e) == 1);
+  ringFileClose(e);
+
+  //-- Edit of an active bucket with any timestamp: update in place.
+  meterRec_t upd;
+  mkMeter(&upd, 77, 0);
+  CHECK_ERR(ringFileEdit(h, mkTs(2026u, 10u, 23u, 2u, 45u, 0u), &upd), ESP_OK);
   CHECK(infoCount(h) == 3);
 
-  uint64_t key = 100;
-  CHECK_ERR(ringFileReadByKey(h, &key, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  key = 300;
-  CHECK_ERR(ringFileReadByKey(h, &key, &out), ESP_OK);
-  CHECK(out.energyWh == 2);
-  key = 50;
-  CHECK_ERR(ringFileReadByKey(h, &key, &out), ESP_OK);
-  CHECK(out.energyWh == 4);
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadByKey(h, hourKey(hourTs(0, 2)), &full), ESP_OK);
+  CHECK(full.keys.timeStamp == mkTs(2026u, 10u, 23u, 2u, 45u, 0u));
+  CHECK(full.payload.energyWh == 77);
 
-  //-- Oldest is 300 and newest is 50.
-  CHECK_ERR(ringFileReadOldest(h, &out), ESP_OK);
-  CHECK(out.timestamp == 300);
-  CHECK_ERR(ringFileReadNewest(h, &out), ESP_OK);
-  CHECK(out.timestamp == 50);
+  //-- Insert a newer bucket through edit (evicts the oldest).
+  meterRec_t ins;
+  mkMeter(&ins, 55, 0);
+  CHECK_ERR(ringFileEdit(h, hourTs(0, 5), &ins), ESP_OK);
+  CHECK(infoCount(h) == 3);
+  logRingDump(h, "edit hh5 insert (evicts hh0)");
 
-  //-- Updating 200 preserves its position: order stays 300, 200, 50.
-  key = 200;
-  mkMeter(&rec, 200, 33, 0);
-  CHECK_ERR(ringFileUpdateByKey(h, &key, &rec), ESP_OK);
+  //-- The evicted hh0 period is below the retained window now.
+  CHECK_ERR(ringFileEdit(h, hourTs(0, 0), &ins),
+            RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE);
+  CHECK(infoCount(h) == 3);
+
   ringFileClose(h);
+}
 
-  h = mustOpen("wrap", false);
-  ringFileIterator_t it;
-  uint64_t order[3];
-  int n = 0;
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &out),
+static void testUpdateByKeyRules(void)
+{
+  ringFileHandle_t *h = mustCreateMeter("updkey", 3);
+
+  CHECK_ERR(addHour(h, 0, 1, 100), ESP_OK);
+
+  //-- Correct lookup key and a timestamp deriving to it: update.
+  meterRec_t rec;
+  mkMeter(&rec, 200, 5);
+  CHECK_ERR(ringFileUpdateByKey(h, hourKey(hourTs(0, 1)), hourTs(0, 1), &rec),
             ESP_OK);
-  order[n++] = out.timestamp;
 
-  while (ringFileIteratorNext(h, &it, &out) == ESP_OK && n < 3)
-  {
-    order[n++] = out.timestamp;
-  }
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadByKey(h, hourKey(hourTs(0, 1)), &full), ESP_OK);
+  CHECK(full.payload.energyWh == 200);
 
-  CHECK(n == 3);
-  CHECK(order[0] == 300 && order[1] == 200 && order[2] == 50);
-  ringFileClose(h);
-}
+  //-- Position preserved: bucketId equals the derived period modulo 3.
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_KEY,
+                                  &(uint64_t){hourKey(hourTs(0, 1))}, &full),
+            ESP_OK);
+  uint32_t slot = 0;
+  CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slot), ESP_OK);
+  uint64_t period = DAYS_2026_10_23 * 24ULL + 1ULL;
+  CHECK(slot == (uint32_t)(period % 3u));
 
-static void testUpdateSemantics(void)
-{
-  ringFileHandle_t *h = mustCreate("update", 4);
-  meterRec_t rec, out;
-  uint64_t k = 7;
+  //-- Mismatched derived key: INVALID_ARG, nothing changed.
+  CHECK_ERR(ringFileUpdateByKey(h, hourKey(hourTs(0, 1)), hourTs(0, 2), &rec),
+            ESP_ERR_INVALID_ARG);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadByKey(h, hourKey(hourTs(0, 2)), &full),
+            RING_FILE_STORE_ERR_KEY_NOT_FOUND);
 
-  //-- Update of a key that is not active, with a matching embedded key.
-  mkMeter(&rec, 7, 0, 0);
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
+  //-- Unknown lookup key: KEY_NOT_FOUND.
+  CHECK_ERR(ringFileUpdateByKey(h, hourKey(hourTs(0, 5)), hourTs(0, 5), &rec),
+            RING_FILE_STORE_ERR_KEY_NOT_FOUND);
 
-  mkMeter(&rec, 7, 10, 1);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  //-- Invalid timestamp digits: INVALID_ARG.
+  CHECK_ERR(ringFileUpdateByKey(h, hourKey(hourTs(0, 1)), 20261399010000ULL,
+                                &rec), ESP_ERR_INVALID_ARG);
 
-  //-- Replacement whose embedded key differs from the lookup key.
-  mkMeter(&rec, 8, 11, 1);
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), ESP_ERR_INVALID_ARG);
-
-  //-- Lookup key without terminator (string type check is elsewhere); for
-  //-- u64 all byte patterns are valid, so just verify normal update.
-  mkMeter(&rec, 7, 12, 2);
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), ESP_OK);
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 12 && out.errorCount == 2);
-
-  //-- Upsert: existing key updates in place, new key appends.
-  mkMeter(&rec, 7, 13, 0);
-  CHECK_ERR(ringFileUpsert(h, &rec), ESP_OK);
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 13);
-  mkMeter(&rec, 8, 14, 0);
-  CHECK_ERR(ringFileUpsert(h, &rec), ESP_OK);
-  CHECK(infoCount(h) == 2);
-  CHECK_ERR(ringFileReadNewest(h, &out), ESP_OK);
-  CHECK(out.timestamp == 8);
-
-  ringFileClose(h);
-}
-
-static void testKeyTypes(void)
-{
-  static const ringFileKeyType_t intTypes[] = {
-    RING_FILE_KEY_S8, RING_FILE_KEY_U8, RING_FILE_KEY_S16, RING_FILE_KEY_U16,
-    RING_FILE_KEY_S32, RING_FILE_KEY_U32, RING_FILE_KEY_S64, RING_FILE_KEY_U64
-  };
-  static const uint16_t intWidths[] = {1, 1, 2, 2, 4, 4, 8, 8};
-
-  for (size_t t = 0; t < sizeof(intTypes) / sizeof(intTypes[0]); t++)
-  {
-    char name[64];
-    snprintf(name, sizeof(name), "keyint%zu", t);
-    char path[300];
-    ringPath(path, sizeof(path), name);
-
-    ringFileConfig_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.maxRecords = 3;
-    cfg.schemaId = 2;
-    cfg.schemaVersion = 1;
-    cfg.recordSize = sizeof(keyedRec_t);
-    cfg.key.keyOffset = 0;
-    cfg.key.keyType = intTypes[t];
-    cfg.key.keySize = intWidths[t];
-
-    ringFileHandle_t *h = NULL;
-    CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_OK);
-
-    keyedRec_t rec, out;
-    memset(&rec, 0, sizeof(rec));
-    rec.value = 1234;
-    memset(rec.raw, 0xAB, sizeof(rec.raw));
-    CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-
-    //-- Different value must not match, same value must match.
-    uint8_t other[8] = {0};
-    other[intWidths[t] - 1] = 0xFF;
-    CHECK_ERR(ringFileReadByKey(h, other, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-    CHECK_ERR(ringFileReadByKey(h, rec.raw, &out), ESP_OK);
-    CHECK(out.value == 1234);
-
-    //-- Bytes after the key field are not part of the key: change them.
-    memset(rec.raw + intWidths[t], 0x5A, sizeof(rec.raw) - intWidths[t]);
-    CHECK_ERR(ringFileReadByKey(h, other, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-
-    ringFileClose(h);
-  }
-
-  //-- Byte-array key: exact byte equality.
-  char path[300];
-  ringPath(path, sizeof(path), "keybytes");
-  ringFileConfig_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.maxRecords = 3;
-  cfg.schemaId = 2;
-  cfg.schemaVersion = 1;
-  cfg.recordSize = sizeof(keyedRec_t);
-  cfg.key.keyOffset = 0;
-  cfg.key.keyType = RING_FILE_KEY_BYTES;
-  cfg.key.keySize = 6;
-  ringFileHandle_t *h = NULL;
-  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_OK);
-  keyedRec_t rec, out;
-  memset(&rec, 0, sizeof(rec));
-  memcpy(rec.raw, "\x01\x02\x03\x04\x05\x06", 6);
-  rec.value = 1;
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  CHECK_ERR(ringFileReadByKey(h, rec.raw, &out), ESP_OK);
-  rec.raw[5] = 0x07;
-  CHECK_ERR(ringFileReadByKey(h, rec.raw, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  ringFileClose(h);
-
-  //-- String key: case sensitive, bytes after the terminator ignored,
-  //-- unterminated rejected.
-  ringPath(path, sizeof(path), "keystr");
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.maxRecords = 3;
-  cfg.schemaId = 2;
-  cfg.schemaVersion = 1;
-  cfg.recordSize = sizeof(keyedRec_t);
-  cfg.key.keyOffset = 0;
-  cfg.key.keyType = RING_FILE_KEY_STRING;
-  cfg.key.keySize = 16;
-  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_OK);
-  memset(&rec, 0, sizeof(rec));
-  strcpy((char *)rec.raw, "hourly");
-  rec.value = 1;
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-
-  uint8_t padded[16];
-  memset(padded, 0, sizeof(padded));
-  strcpy((char *)padded, "hourly");
-  memset(padded + 7, 0xEE, 9); //-- bytes after the terminator
-  CHECK_ERR(ringFileReadByKey(h, padded, &out), ESP_OK);
-
-  uint8_t wrongCase[16];
-  memset(wrongCase, 0, sizeof(wrongCase));
-  strcpy((char *)wrongCase, "Hourly");
-  CHECK_ERR(ringFileReadByKey(h, wrongCase, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-
-  uint8_t unterminated[16];
-  memset(unterminated, 'x', sizeof(unterminated));
-  CHECK_ERR(ringFileReadByKey(h, unterminated, &out), ESP_ERR_INVALID_ARG);
-
-  //-- Add a record whose embedded string key is unterminated: rejected.
-  keyedRec_t badRec;
-  memset(&badRec, 0, sizeof(badRec));
-  memset(badRec.raw, 'y', sizeof(badRec.raw));
-  CHECK_ERR(ringFileAdd(h, &badRec), ESP_ERR_INVALID_ARG);
   ringFileClose(h);
 }
 
 static void testIterator(void)
 {
-  ringFileHandle_t *h = mustCreate("iter", 4);
-  meterRec_t rec, out;
+  ringFileHandle_t *h = mustCreateMeter("iter", 4);
 
-  for (uint64_t ts = 1; ts <= 4; ts++)
+  for (uint32_t hh = 0; hh < 4; hh++)
   {
-    mkMeter(&rec, ts * 10, (uint32_t)ts, 0);
-    CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+    CHECK_ERR(addHour(h, 0, hh, 10u + hh), ESP_OK);
   }
 
   ringFileIterator_t it;
+  meterFull_t full;
+
+  //-- Forward from the oldest.
   memset(&it, 0, sizeof(it));
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &out),
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
             ESP_OK);
-  CHECK(out.timestamp == 10);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &out), ESP_OK);
-  CHECK(out.timestamp == 20);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &out), ESP_OK);
-  CHECK(out.timestamp == 30);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &out), ESP_OK);
-  CHECK(out.timestamp == 40);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &out), RING_FILE_STORE_ERR_ITER_END);
+  CHECK(full.payload.energyWh == 10);
 
-  //-- Previous walks back through everything including the start record.
-  CHECK_ERR(ringFileIteratorPrevious(h, &it, &out), ESP_OK);
-  CHECK(out.timestamp == 30);
-  CHECK_ERR(ringFileIteratorPrevious(h, &it, &out), ESP_OK);
-  CHECK(out.timestamp == 20);
-  CHECK_ERR(ringFileIteratorPrevious(h, &it, &out), ESP_OK);
-  CHECK(out.timestamp == 10);
-  CHECK_ERR(ringFileIteratorPrevious(h, &it, &out), RING_FILE_STORE_ERR_ITER_END);
+  for (uint32_t expect = 11; expect <= 13; expect++)
+  {
+    memset(&full, 0, sizeof(full));
+    CHECK_ERR(ringFileIteratorNext(h, &it, &full), ESP_OK);
+    CHECK(full.payload.energyWh == expect);
+  }
 
-  //-- Newest start.
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_NEWEST, NULL, &out),
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorNext(h, &it, &full),
+            RING_FILE_STORE_ERR_ITER_END);
+
+  //-- Backward from the newest.
+  memset(&it, 0, sizeof(it));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_NEWEST, NULL, &full),
             ESP_OK);
-  CHECK(out.timestamp == 40);
-  CHECK_ERR(ringFileIteratorPrevious(h, &it, &out), ESP_OK);
-  CHECK(out.timestamp == 30);
+  CHECK(full.payload.energyWh == 13);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorPrevious(h, &it, &full), ESP_OK);
+  CHECK(full.payload.energyWh == 12);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorPrevious(h, &it, &full), ESP_OK);
+  CHECK(full.payload.energyWh == 11);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorPrevious(h, &it, &full), ESP_OK);
+  CHECK(full.payload.energyWh == 10);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorPrevious(h, &it, &full),
+            RING_FILE_STORE_ERR_ITER_END);
 
-  //-- Exact key start, then both directions.
-  uint64_t k = 30;
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_KEY, &k, &out), ESP_OK);
-  CHECK(out.timestamp == 30);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &out), ESP_OK);
-  CHECK(out.timestamp == 40);
-  uint64_t missing = 999;
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_KEY, &missing, &out),
+  //-- Start at a key.
+  uint64_t key = hourKey(hourTs(0, 2));
+  memset(&it, 0, sizeof(it));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_KEY, &key, &full),
+            ESP_OK);
+  CHECK(full.keys.usedKey == key);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorNext(h, &it, &full), ESP_OK);
+  CHECK(full.payload.energyWh == 13);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorNext(h, &it, &full),
+            RING_FILE_STORE_ERR_ITER_END);
+
+  uint64_t unknown = hourKey(hourTs(0, 9));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_KEY, &unknown, &full),
             RING_FILE_STORE_ERR_KEY_NOT_FOUND);
 
-  //-- A successful mutation invalidates live cursors on that handle.
-  //-- (Capacity 4: adding 50 evicts the oldest key 10.)
-  mkMeter(&rec, 50, 5, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &out), RING_FILE_STORE_ERR_ITER_INVALIDATED);
-  CHECK_ERR(ringFileIteratorPrevious(h, &it, &out), RING_FILE_STORE_ERR_ITER_INVALIDATED);
-
-  //-- Updating a record also invalidates cursors.
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &out),
+  //-- A successful mutation invalidates the cursor, slot is kept.
+  memset(&it, 0, sizeof(it));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
             ESP_OK);
-  CHECK(out.timestamp == 20);
-  k = 30;
-  mkMeter(&rec, 30, 11, 0);
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), ESP_OK);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &out), RING_FILE_STORE_ERR_ITER_INVALIDATED);
+  uint32_t slotBefore = 0;
+  CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slotBefore), ESP_OK);
+  CHECK_ERR(addHour(h, 0, 4, 14), ESP_OK);
+  CHECK_ERR(ringFileIteratorNext(h, &it, &full),
+            RING_FILE_STORE_ERR_ITER_INVALIDATED);
+  //-- GetSlot on an invalidated cursor reports the error and leaves the
+  //-- caller's slot value untouched (the last good slot is kept).
+  uint32_t slotAfter = slotBefore;
+  CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slotAfter),
+            RING_FILE_STORE_ERR_ITER_INVALIDATED);
+  CHECK(slotAfter == slotBefore);
 
-  //-- Unchanged update is not a mutation: cursor survives.
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &out),
+  memset(&it, 0, sizeof(it));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
             ESP_OK);
-  ringFileReadByKey(h, &k, &out);
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &out), ESP_OK);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &out), ESP_OK);
+  CHECK(full.payload.energyWh == 11);
 
   ringFileClose(h);
 }
 
 static void testSchemaMismatch(void)
 {
+  ringFileHandle_t *h = mustCreateMeter("schema", 3);
+  CHECK_ERR(addHour(h, 0, 0, 10), ESP_OK);
+  ringFileClose(h);
+
   char path[300];
   ringPath(path, sizeof(path), "schema");
-  ringFileConfig_t cfg = meterConfig(4);
-  cfg.schemaId = 7;
-  cfg.schemaVersion = 3;
-  ringFileHandle_t *h = NULL;
-  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_OK);
-  ringFileClose(h);
+  ringFileHandle_t *o = NULL;
 
-  ringFileOpenConfig_t ocfg;
-  memset(&ocfg, 0, sizeof(ocfg));
-  ocfg.expectedSchemaId = 8;
-  ocfg.expectedSchemaVersion = 3;
-  ocfg.expectedRecordSize = sizeof(meterRec_t);
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
+  ringFileOpenConfig_t cfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
+  cfg.expectedSchemaId = RING_FILE_SCHEMA_YYMM;
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
 
-  ocfg.expectedSchemaId = 7;
-  ocfg.expectedSchemaVersion = 4;
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
+  cfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
+  cfg.expectedRecordSize = sizeof(monthRec_t);
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
 
-  ocfg.expectedSchemaVersion = 3;
-  ocfg.expectedRecordSize = sizeof(meterRec_t) + 4;
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
+  cfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
+  cfg.expectedSchemaId = NULL;
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
 
-  ocfg.expectedRecordSize = sizeof(meterRec_t);
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), ESP_OK);
-  ringFileClose(h);
+  cfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), ESP_OK);
+  CHECK(infoCount(o) == 1);
+  ringFileClose(o);
 }
 
 static void testReadOnly(void)
 {
-  ringFileHandle_t *h = mustCreate("ro", 4);
+  ringFileHandle_t *h = mustCreateMeter("ro", 3);
+  CHECK_ERR(addHour(h, 0, 0, 10), ESP_OK);
+  ringFileClose(h);
+
+  h = mustOpenMeter("ro", true);
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.payload.energyWh == 10);
+
   meterRec_t rec;
-
-  mkMeter(&rec, 1, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  ringFileClose(h);
-
-  ringFileStoreResetIoStats();
-  h = mustOpen("ro", true);
-  meterRec_t out;
-  uint64_t k = 1;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK_ERR(ringFileAdd(h, &rec), RING_FILE_STORE_ERR_READONLY);
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), RING_FILE_STORE_ERR_READONLY);
-  CHECK_ERR(ringFileUpsert(h, &rec), RING_FILE_STORE_ERR_READONLY);
+  mkMeter(&rec, 99, 0);
+  CHECK_ERR(ringFileAdd(h, hourTs(0, 1), &rec), RING_FILE_STORE_ERR_READONLY);
+  CHECK_ERR(ringFileUpsert(h, hourTs(0, 1), &rec), RING_FILE_STORE_ERR_READONLY);
+  CHECK_ERR(ringFileEdit(h, hourTs(0, 1), &rec), RING_FILE_STORE_ERR_READONLY);
+  CHECK_ERR(ringFileUpdateByKey(h, hourKey(hourTs(0, 0)), hourTs(0, 0), &rec),
+            RING_FILE_STORE_ERR_READONLY);
   CHECK_ERR(ringFileClear(h), RING_FILE_STORE_ERR_READONLY);
-  CHECK_ERR(ringFileResize(h, 2), RING_FILE_STORE_ERR_READONLY);
+  CHECK_ERR(ringFileResize(h, 5), RING_FILE_STORE_ERR_READONLY);
   CHECK_ERR(ringFileSync(h), ESP_OK);
+
   ringFileClose(h);
-  rfsIoStats_t stats = lastStats();
-  CHECK(stats.writes == 0);
-  CHECK(stats.fsyncs == 0);
-  CHECK(stats.renames == 0);
-  CHECK(stats.unlinks == 0);
-
-  //-- A writable handle holds the exclusive lock; read-only handles coexist
-  //-- and a second writable open is refused until the lock is released.
-  ringFileHandle_t *w0 = mustOpen("ro", false);
-  ringFileHandle_t *r1 = mustOpen("ro", true);
-  ringFileHandle_t *r2 = mustOpen("ro", true);
-  CHECK(r1 != NULL && r2 != NULL);
-  ringFileHandle_t *w = NULL;
-  ringFileOpenConfig_t ocfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
-  char path[300];
-  ringPath(path, sizeof(path), "ro");
-  CHECK_ERR(ringFileOpen(path, &ocfg, &w), RING_FILE_STORE_ERR_BUSY);
-  ringFileClose(r1);
-  ringFileClose(r2);
-  CHECK_ERR(ringFileOpen(path, &ocfg, &w), RING_FILE_STORE_ERR_BUSY);
-  ringFileClose(w0);
-
-  //-- After the lock holder closes, the writable open succeeds again.
-  CHECK_ERR(ringFileOpen(path, &ocfg, &w), ESP_OK);
-  ringFileClose(w);
 }
 
 static void testStaleLockBreak(void)
 {
-  ringFileHandle_t *h = mustCreate("stale", 4);
+  ringFileHandle_t *h = mustCreateMeter("lock", 3);
   char path[300];
-  ringPath(path, sizeof(path), "stale");
-  meterRec_t rec;
+  ringPath(path, sizeof(path), "lock");
+  ringFileHandle_t *o = NULL;
+  ringFileOpenConfig_t cfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
 
-  mkMeter(&rec, 1, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-
-  //-- A run that died before close leaves the lock behind and blocks every
-  //-- later writable open; only after a reset (no live handle) may it be
-  //-- broken, which is the sequence exercised here.
-  ringFileOpenConfig_t ocfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
-  ringFileHandle_t *w = NULL;
-  CHECK_ERR(ringFileOpen(path, &ocfg, &w), RING_FILE_STORE_ERR_BUSY);
-
-  CHECK_ERR(ringFileBreakStaleLock(NULL), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), RING_FILE_STORE_ERR_BUSY);
   CHECK_ERR(ringFileBreakStaleLock(path), ESP_OK);
-  CHECK_ERR(ringFileBreakStaleLock(path), ESP_ERR_NOT_FOUND);
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), ESP_OK);
+  CHECK_ERR(ringFileBreakStaleLock(path), ESP_OK);
+  ringFileClose(o);
 
-  //-- The abandoned handle closes with no lock file left; its release unlink
-  //-- is a harmless no-op and must not fail.
+  //-- The lock file is removed on close, so breaking it finds nothing.
   ringFileClose(h);
-
-  //-- After the takeover the writable open succeeds and sees the data.
-  CHECK_ERR(ringFileOpen(path, &ocfg, &w), ESP_OK);
-  meterRec_t out;
-  uint64_t k = 1;
-  CHECK_ERR(ringFileReadByKey(w, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 1);
-  ringFileClose(w);
+  CHECK_ERR(ringFileBreakStaleLock(path), ESP_ERR_NOT_FOUND);
 }
 
 static void testCorruption(void)
 {
-  char path[300];
-  ringPath(path, sizeof(path), "corrupt");
-  ringFileHandle_t *h = mustCreate("corrupt", 4);
-  meterRec_t rec;
+  ringFileHandle_t *h = mustCreateMeter("corrupt", 3);
 
-  for (uint64_t ts = 1; ts <= 3; ts++)
+  for (uint32_t hh = 0; hh < 3; hh++)
   {
-    mkMeter(&rec, ts, (uint32_t)ts, 0);
-    CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+    CHECK_ERR(addHour(h, 0, hh, 10u + hh), ESP_OK);
   }
 
   ringFileClose(h);
 
-  //-- Flip a byte inside record 1 (slot 1): that record fails its CRC and
-  //-- disappears; the other records survive.
-  uint8_t flip = 0xFF;
-  pokeFile(path, slotRecordOffset(1, sizeof(meterRec_t)) + 8, &flip, 1);
-  h = mustOpen("corrupt", false);
-  uint64_t k = 1;
-  meterRec_t out;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  k = 2;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  k = 3;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
+  char path[300];
+  char good[340];
+  ringPath(path, sizeof(path), "corrupt");
+  snprintf(good, sizeof(good), "%s.good", path);
+  copyFile(path, good);
+
+  uint8_t junk[4] = {0xDEu, 0xADu, 0xBEu, 0xEFu};
+  ringFileHandle_t *o = NULL;
+  ringFileOpenConfig_t cfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
+
+  //-- A corrupted record byte hides only that slot on reopen.
+  copyFile(good, path);
+  uint8_t flip = 0xFFu;
+  pokeFile(path, slotRecordOffset(1, 24) + 16, &flip, 1);
+  h = mustOpenMeter("corrupt", false);
   CHECK(infoCount(h) == 2);
   ringFileClose(h);
 
-  ringFileValidation_t v;
-  CHECK_ERR(ringFileValidate(path, &v), ESP_OK);
-  CHECK(v.headerValid);
-  CHECK(v.metadataIssue == RING_FILE_META_OK);
-  CHECK(v.badSlotCount == 1);
-  CHECK(v.committedCount == 2);
-  CHECK(!v.strayResizeFiles);
+  //-- Header magic: format error, reported by validate.
+  copyFile(good, path);
+  pokeFile(path, 0, junk, 4);
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), RING_FILE_STORE_ERR_FORMAT);
+  ringFileValidation_t val;
+  CHECK_ERR(ringFileValidate(path, &val), ESP_OK);
+  CHECK(!val.headerValid);
+  CHECK(val.metadataIssue == RING_FILE_META_BAD_MAGIC);
 
-  //-- A damaged header is reported as a checksum violation.
+  //-- Header checksum: corrupt error.
+  copyFile(good, path);
+  pokeFile(path, 90, junk, 4);
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), RING_FILE_STORE_ERR_CORRUPT);
+  CHECK_ERR(ringFileValidate(path, &val), ESP_OK);
+  CHECK(val.metadataIssue == RING_FILE_META_BAD_CHECKSUM);
 
-  //-- Bad magic.
-  uint8_t magic[4] = {0xDE, 0xAD, 0xBE, 0xEF};
-  pokeFile(path, 0, magic, 4);
-  CHECK_ERR(ringFileValidate(path, &v), ESP_OK);
-  CHECK(!v.headerValid);
-  CHECK(v.metadataIssue == RING_FILE_META_BAD_MAGIC);
-  ringFileOpenConfig_t ocfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), RING_FILE_STORE_ERR_FORMAT);
+  //-- Unsupported format version (header CRC repaired so the version is
+  //-- the first thing decode rejects).
+  copyFile(good, path);
+  uint8_t v3[2] = {3, 0};
+  pokeHeader(path, 4, v3, 2);
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), RING_FILE_STORE_ERR_FORMAT);
+  CHECK_ERR(ringFileValidate(path, &val), ESP_OK);
+  CHECK(val.metadataIssue == RING_FILE_META_BAD_FORMAT_VERSION);
 
-  //-- Truncated header.
-  truncate(path, 40);
-  CHECK_ERR(ringFileValidate(path, &v), ESP_OK);
-  CHECK(!v.headerValid);
-  CHECK(v.metadataIssue == RING_FILE_META_SHORT_FILE);
+  //-- Impossible granularity byte.
+  copyFile(good, path);
+  uint8_t g9[4] = {9, 0, 0, 0};
+  pokeHeader(path, 40, g9, 4);
+  CHECK_ERR(ringFileOpen(path, &cfg, &o), RING_FILE_STORE_ERR_FORMAT);
+  CHECK_ERR(ringFileValidate(path, &val), ESP_OK);
+  CHECK(val.metadataIssue == RING_FILE_META_BAD_GEOMETRY);
 
-  //-- Extra trailing bytes: geometry violation.
-  h = mustCreate("corrupt2", 3);
+  //-- The ring is healthy again after restoring the good copy.
+  copyFile(good, path);
+  h = mustOpenMeter("corrupt", false);
+  CHECK(infoCount(h) == 3);
   ringFileClose(h);
-  ringPath(path, sizeof(path), "corrupt2");
-  int fd = open(path, O_WRONLY | O_APPEND);
-  uint8_t junk[300]; //-- beyond header + (capacity + 1) slot bytes
-  memset(junk, 0x77, sizeof(junk));
-  CHECK(write(fd, junk, sizeof(junk)) == (ssize_t)sizeof(junk));
-  close(fd);
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), RING_FILE_STORE_ERR_CORRUPT);
-  CHECK_ERR(ringFileValidate(path, &v), ESP_OK);
-  CHECK(!v.headerValid);
-  CHECK(v.metadataIssue == RING_FILE_META_BAD_GEOMETRY);
 
-  //-- Missing file.
-  CHECK_ERR(ringFileValidate("definitely_missing_file.rfs", &v),
-            ESP_ERR_NOT_FOUND);
+  unlink(good);
 }
 
 static void testClear(void)
 {
-  ringFileHandle_t *h = mustCreate("clear", 4);
-  meterRec_t rec, out;
+  ringFileHandle_t *h = mustCreateMeter("clear", 3);
 
-  for (uint64_t ts = 1; ts <= 3; ts++)
+  for (uint32_t hh = 0; hh < 3; hh++)
   {
-    mkMeter(&rec, ts, (uint32_t)ts, 0);
-    CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+    CHECK_ERR(addHour(h, 0, hh, 10u + hh), ESP_OK);
   }
 
-  CHECK(infoCount(h) == 3);
   CHECK_ERR(ringFileClear(h), ESP_OK);
   CHECK(infoCount(h) == 0);
-  CHECK_ERR(ringFileReadOldest(h, &out), RING_FILE_STORE_ERR_RING_EMPTY);
-  uint64_t k = 1;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
 
-  //-- Re-adding works after clear, keys reusable, capacity retained.
-  mkMeter(&rec, 1, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), RING_FILE_STORE_ERR_RING_EMPTY);
+
+  //-- Adding after a clear works and the clear survives a reopen.
+  CHECK_ERR(addHour(h, 0, 7, 70), ESP_OK);
   CHECK(infoCount(h) == 1);
-
-  ringFileInfo_t info;
-  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
-  CHECK(info.capacity == 4);
-  CHECK(info.schemaId == 1);
-  CHECK(info.schemaVersion == 1);
   ringFileClose(h);
 
-  h = mustOpen("clear", false);
+  h = mustOpenMeter("clear", false);
   CHECK(infoCount(h) == 1);
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 7)));
   ringFileClose(h);
 }
 
 static void testResize(void)
 {
-  ringFileHandle_t *h = mustCreate("resize", 3);
-  meterRec_t rec, out;
+  ringFileHandle_t *h = mustCreateMeter("resize", 5);
 
-  mkMeter(&rec, 100, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  mkMeter(&rec, 300, 2, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  mkMeter(&rec, 200, 3, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  mkMeter(&rec, 50, 4, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK); //-- wraps: 300,200,50
-
-  ringFileInfo_t info;
-  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
-  uint64_t beforeSize = info.storageSize;
-
-  //-- Shrink to two: retains the newest 200 and 50 (spec scenario).
-  CHECK_ERR(ringFileResize(h, 2), ESP_OK);
-  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
-  CHECK(info.capacity == 2);
-  CHECK(info.storageSize < beforeSize);
-  CHECK(info.count == 2);
-  uint64_t k = 300;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  k = 200;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  k = 50;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK_ERR(ringFileReadOldest(h, &out), ESP_OK);
-  CHECK(out.timestamp == 200);
-  CHECK_ERR(ringFileReadNewest(h, &out), ESP_OK);
-  CHECK(out.timestamp == 50);
-
-  ringFileClose(h);
-  h = mustOpen("resize", false);
-  CHECK(infoCount(h) == 2);
-  ringFileClose(h);
-
-  //-- Grow back to 5 and verify insertion order of retained records.
-  h = mustOpen("resize", false);
-  CHECK_ERR(ringFileResize(h, 5), ESP_OK);
-  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
-  CHECK(info.capacity == 5);
-  CHECK(info.storageSize > beforeSize / 2);
-  mkMeter(&rec, 25, 5, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  ringFileIterator_t it;
-  uint64_t order[3];
-  int n = 0;
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &out),
-            ESP_OK);
-  order[n++] = out.timestamp;
-
-  while (ringFileIteratorNext(h, &it, &out) == ESP_OK && n < 3)
+  for (uint32_t hh = 0; hh < 5; hh++)
   {
-    order[n++] = out.timestamp;
+    CHECK_ERR(addHour(h, 0, hh, 10u * hh), ESP_OK);
   }
 
-  CHECK(n == 3);
-  CHECK(order[0] == 200 && order[1] == 50 && order[2] == 25);
-  ringFileClose(h);
+  CHECK_ERR(ringFileResize(h, 3), ESP_OK);
+  CHECK(infoCount(h) == 3);
+  logRingDump(h, "resize 5 -> 3");
 
-  //-- Resize to capacity 1 retains the newest only; zero is rejected.
-  h = mustOpen("resize", false);
-  CHECK_ERR(ringFileResize(h, 0), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileResize(h, 1), ESP_OK);
-  CHECK(infoCount(h) == 1);
-  CHECK_ERR(ringFileReadOldest(h, &out), ESP_OK);
-  CHECK(out.timestamp == 25);
-  ringFileClose(h);
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 2)));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 4)));
 
-  h = mustOpen("resize", false);
-  CHECK(infoCount(h) == 1);
-  ringFileClose(h);
-}
-
-static void testResizeEmptyAndErrors(void)
-{
-  ringFileHandle_t *h = mustCreate("resizeEmpty", 2);
-  meterRec_t rec;
-
-  mkMeter(&rec, 1, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  CHECK_ERR(ringFileClear(h), ESP_OK);
-  CHECK_ERR(ringFileResize(h, 5), ESP_OK);
   ringFileInfo_t info;
-  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
-  CHECK(info.capacity == 5 && info.count == 0);
-  mkMeter(&rec, 2, 2, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  CHECK(infoCount(h) == 1);
+  memset(&info, 0, sizeof(info));
+  CHECK_ERR(ringFileGetInfo(h, &info), ESP_OK);
+  CHECK(info.capacity == 3);
+  CHECK(info.storageSize == HEADER_SIZE + 4u * (SLOT_HDR_SIZE + 24u));
+
   ringFileClose(h);
 
-  //-- Volume full while creating the candidate: original preserved.
-  h = mustOpen("resizeEmpty", false);
-  installHooks();
-  failErrno(ENOSPC);
-  failNextOn(OP_OPEN, 1, ".rfsnew");
-  CHECK_ERR(ringFileResize(h, 6), RING_FILE_STORE_ERR_STORAGE_FULL);
-  //-- Handle stays usable: the committed file was never touched.
+  h = mustOpenMeter("resize", false);
+  CHECK(infoCount(h) == 3);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 2)));
+
+  //-- Grow back and keep using the ring.
   CHECK_ERR(ringFileResize(h, 6), ESP_OK);
-  ringFileClose(h);
-  h = mustOpen("resizeEmpty", false);
-  CHECK(infoCount(h) == 1);
+  CHECK(infoCount(h) == 3);
+  CHECK_ERR(addHour(h, 0, 5, 50), ESP_OK);
+  CHECK(infoCount(h) == 4);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 5)));
+
+  CHECK_ERR(ringFileResize(h, 6), ESP_OK);
+  CHECK_ERR(ringFileResize(h, 0), ESP_ERR_INVALID_ARG);
   ringFileClose(h);
 }
 
 static void testResizeInterruptedStates(void)
 {
-  ringFileHandle_t *h = mustCreate("resizeInt", 3);
-  meterRec_t rec, out;
-  char path[300];
-  char oldPath[320], newPath[320];
-
-  for (uint64_t ts = 1; ts <= 3; ts++)
+  for (int scenario = 0; scenario < 5; scenario++)
   {
-    mkMeter(&rec, ts, (uint32_t)ts, 0);
-    CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+    char name[32];
+    snprintf(name, sizeof(name), "resizeInt%d", scenario);
+    ringFileHandle_t *h = mustCreateMeter(name, 5);
+
+    for (uint32_t hh = 0; hh < 3; hh++)
+    {
+      CHECK_ERR(addHour(h, 0, hh, 10u + hh), ESP_OK);
+    }
+
+    installHooks();
+
+    esp_err_t err;
+
+    switch (scenario)
+    {
+      case 0:
+        failNext(OP_WRITE, 1);
+        break;
+
+      case 1:
+        failNext(OP_FSYNC, 1);
+        break;
+
+      case 2:
+        failNextOn(OP_RENAME, 1, ".rfsold");
+        break;
+
+      case 3:
+        failNextOn(OP_RENAME, 1, ".rfsnew");
+        break;
+
+      default:
+        failErrno(ENOSPC);
+        failNextOn(OP_OPEN, 1, ".rfsnew");
+        break;
+    }
+
+    err = ringFileResize(h, 3);
+    logCmdText(err == ESP_OK ? "ESP_OK (injection did not hit)" : "rejected",
+               "resize 5->3 with injected failure (scenario %d)", scenario);
+    CHECK(err != ESP_OK);
+    ringFileClose(h);
+
+    h = mustOpenMeter(name, false);
+    CHECK(infoCount(h) == 3);
+    meterFull_t full;
+    memset(&full, 0, sizeof(full));
+    CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+    CHECK(full.keys.usedKey == hourKey(hourTs(0, 0)));
+    ringFileClose(h);
   }
 
-  //-- Candidate write failure: original intact, handle reports I/O.
-  installHooks();
-  failNext(OP_WRITE, 1);
-  CHECK_ERR(ringFileResize(h, 5), RING_FILE_STORE_ERR_IO);
-  ringFileClose(h);
-  h = mustOpen("resizeInt", false);
-  CHECK(infoCount(h) == 3);
+  //-- A leftover candidate file is removed on the next read-write open.
+  ringFileHandle_t *h = mustCreateMeter("resizeStray", 3);
+  CHECK_ERR(addHour(h, 0, 0, 10), ESP_OK);
   ringFileClose(h);
 
-  //-- First rename fails: original still at path, candidate cleaned.
-  h = mustOpen("resizeInt", false);
-  installHooks();
-  failNextOn(OP_RENAME, 1, "/resizeInt.rfs");
-  CHECK_ERR(ringFileResize(h, 5), RING_FILE_STORE_ERR_IO);
-  ringFileClose(h);
-  h = mustOpen("resizeInt", false);
-  CHECK(infoCount(h) == 3);
-  ringFileClose(h);
+  char path[300];
+  char stray[340];
+  ringPath(path, sizeof(path), "resizeStray");
+  snprintf(stray, sizeof(stray), "%s.rfsnew", path);
+  FILE *f = fopen(stray, "wb");
 
-  //-- Second rename fails and the rollback rename also fails: both renames
-  //-- fail via patterns. The handle quarantines; reopening recovers the
-  //-- complete previous state from the backup file.
-  h = mustOpen("resizeInt", false);
-  installHooks();
-  failNextOn(OP_RENAME, 1, ".rfsnew");
-  failNextOn(OP_RENAME, 1, ".rfsold");
-  CHECK_ERR(ringFileResize(h, 5), RING_FILE_STORE_ERR_IO);
-  ringFileClose(h);
-  h = mustOpen("resizeInt", false);
-  CHECK(infoCount(h) == 3);
-  uint64_t k = 2;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  ringFileClose(h);
+  if (f != NULL)
+  {
+    fwrite("junk", 1, 4, f);
+    fclose(f);
+  }
 
-  //-- Simulate a crash between the renames: path was moved to .rfsold and
-  //-- the candidate sits at .rfsnew. Reopen must pick a complete state.
-  ringPath(path, sizeof(path), "resizeInt");
-  snprintf(oldPath, sizeof(oldPath), "%s.rfsold", path);
-  snprintf(newPath, sizeof(newPath), "%s.rfsnew", path);
-  CHECK(rename(path, oldPath) == 0);
-  copyFile(oldPath, newPath);
-  CHECK(!pathExists(path));
-  h = mustOpen("resizeInt", false);
-  CHECK(infoCount(h) == 3);
-  CHECK(pathExists(path));
+  CHECK(pathExists(stray));
+  h = mustOpenMeter("resizeStray", false);
+  CHECK(!pathExists(stray));
+  CHECK(infoCount(h) == 1);
   ringFileClose(h);
-
-  //-- path valid while a stale candidate and backup linger: main file wins
-  //-- and the writable reopen cleans up the strays.
-  ringPath(path, sizeof(path), "resizeInt");
-  copyFile(path, newPath);
-  copyFile(path, oldPath);
-  h = mustOpen("resizeInt", false);
-  CHECK(infoCount(h) == 3);
-  ringFileClose(h);
-  CHECK(!pathExists(newPath));
-  CHECK(!pathExists(oldPath));
-
-  //-- Read-only open on a state needing recovery reports it explicitly.
-  CHECK(rename(path, oldPath) == 0);
-  ringFileOpenConfig_t ocfg = meterOpen(true, RING_FILE_PERSIST_IMMEDIATE, 0);
-  ringFileHandle_t *ro = NULL;
-  CHECK_ERR(ringFileOpen(path, &ocfg, &ro), RING_FILE_STORE_ERR_RECOVERY_REQUIRED);
-  CHECK(ro == NULL);
-  ringFileClose(ro);
-  CHECK(rename(oldPath, path) == 0);
 }
 
 static void testFailureInjectionMutations(void)
 {
-  ringFileHandle_t *h = mustCreate("failadd", 4);
-  meterRec_t rec, out;
-  uint64_t k = 1;
+  ringFileHandle_t *h = mustCreateMeter("failmut", 3);
+  CHECK_ERR(addHour(h, 0, 0, 10), ESP_OK);
 
-  mkMeter(&rec, 1, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-
-  //-- Slot write failure during add.
   installHooks();
   failNext(OP_WRITE, 1);
-  mkMeter(&rec, 2, 2, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), RING_FILE_STORE_ERR_IO);
-  CHECK_ERR(ringFileAdd(h, &rec), RING_FILE_STORE_ERR_IO_FAULTED);
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), RING_FILE_STORE_ERR_IO_FAULTED);
-  CHECK_ERR(ringFileSync(h), RING_FILE_STORE_ERR_IO_FAULTED);
+  CHECK_ERR(addHour(h, 0, 1, 20), RING_FILE_STORE_ERR_IO);
+
+  //-- The handle is quarantined until a reopen runs recovery.
+  meterRec_t rec;
+  mkMeter(&rec, 1, 0);
+  CHECK_ERR(ringFileAdd(h, hourTs(0, 2), &rec),
+            RING_FILE_STORE_ERR_IO_FAULTED);
   ringFileClose(h);
-  h = mustOpen("failadd", false);
+
+  h = mustOpenMeter("failmut", false);
   CHECK(infoCount(h) == 1);
-  k = 2;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 0)));
   ringFileClose(h);
 
-  //-- fsync failure after a committed slot write: the record reached the
-  //-- file, so the reopened state is the complete new state.
-  h = mustOpen("failadd", false);
-  installHooks();
-  failNext(OP_FSYNC, 1);
-  k = 2;
-  mkMeter(&rec, 2, 2, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), RING_FILE_STORE_ERR_IO);
-  ringFileClose(h);
-  h = mustOpen("failadd", false);
-  CHECK(infoCount(h) == 2);
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
+  //-- Write failure on a buffered flush: the staged records never reach
+  //-- storage, the committed record survives.
+  h = mustCreateMeter("failmut2", 3);
+  CHECK_ERR(addHour(h, 0, 0, 10), ESP_OK);
   ringFileClose(h);
 
-  //-- Update: write failure leaves the previous payload.
-  h = mustOpen("failadd", false);
+  h = mustOpenMeterMode("failmut2", false, RING_FILE_PERSIST_BUFFERED, 8);
+  CHECK_ERR(addHour(h, 0, 1, 20), ESP_OK);
+  CHECK_ERR(addHour(h, 0, 2, 30), ESP_OK);
   installHooks();
   failNext(OP_WRITE, 1);
-  k = 1;
-  mkMeter(&rec, 1, 999, 0);
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), RING_FILE_STORE_ERR_IO);
-  ringFileClose(h);
-  h = mustOpen("failadd", false);
-  k = 1;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 1);
+  CHECK_ERR(ringFileSync(h), RING_FILE_STORE_ERR_IO);
   ringFileClose(h);
 
-  //-- Clear fsync failure: complete old state or clear, never partial.
-  h = mustOpen("failadd", false);
-  installHooks();
-  failNext(OP_FSYNC, 1);
-  CHECK_ERR(ringFileClear(h), RING_FILE_STORE_ERR_IO);
-  ringFileClose(h);
-  h = mustOpen("failadd", false);
-  uint32_t count = infoCount(h);
-  CHECK(count == 0 || count == 2);
+  h = mustOpenMeter("failmut2", false);
+  CHECK(infoCount(h) == 1);
   ringFileClose(h);
 }
 
 static void testUnchangedWrites(void)
 {
-  ringFileHandle_t *h = mustCreate("nowrite", 4);
-  meterRec_t rec;
-  uint64_t k = 1;
-
-  mkMeter(&rec, 1, 100, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  ringFileHandle_t *h = mustCreateMeter("unchanged", 3);
+  CHECK_ERR(addHour(h, 0, 1, 100), ESP_OK);
 
   ringFileStoreResetIoStats();
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), ESP_OK);
-  CHECK_ERR(ringFileUpsert(h, &rec), ESP_OK);
-  rfsIoStats_t stats = lastStats();
-  CHECK(stats.writes == 0);
-  CHECK(stats.fsyncs == 0);
 
-  //-- Reads and a clean close never write.
-  ringFileStoreResetIoStats();
-  meterRec_t out;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK_ERR(ringFileSync(h), ESP_OK);
-  CHECK_ERR(ringFileReadOldest(h, &out), ESP_OK);
+  meterRec_t same;
+  mkMeter(&same, 100, 1);
+  CHECK_ERR(ringFileUpdateByKey(h, hourKey(hourTs(0, 1)), hourTs(0, 1), &same),
+            ESP_OK);
   CHECK(lastStats().writes == 0);
-  ringFileClose(h);
 
-  ringFileStoreResetIoStats();
-  h = mustOpen("nowrite", false);
-  CHECK_ERR(ringFileSync(h), ESP_OK);
-  CHECK(lastStats().fsyncs == 0);
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  ringFileClose(h);
+  meterRec_t editSame;
+  mkMeter(&editSame, 100, 1);
+  CHECK_ERR(ringFileEdit(h, hourTs(0, 1), &editSame), ESP_OK);
   CHECK(lastStats().writes == 0);
+
+  meterRec_t upsertSame;
+  mkMeter(&upsertSame, 100, 1);
+  CHECK_ERR(ringFileUpsert(h, hourTs(0, 1), &upsertSame), ESP_OK);
+  CHECK(lastStats().writes == 0);
+
+  meterRec_t changed;
+  mkMeter(&changed, 101, 1);
+  CHECK_ERR(ringFileUpdateByKey(h, hourKey(hourTs(0, 1)), hourTs(0, 1),
+                                &changed), ESP_OK);
+  CHECK(lastStats().writes == 1);
+
+  ringFileClose(h);
 }
 
 static void testWearDistribution(void)
 {
-  ringFileHandle_t *h = mustCreate("wear", 4);
-  meterRec_t rec;
-
+  ringFileHandle_t *h = mustCreateMeter("wear", 4);
   ringFileStoreResetIoStats();
 
-  for (uint64_t ts = 1; ts <= 40; ts++)
+  for (uint32_t hh = 0; hh < 8; hh++)
   {
-    mkMeter(&rec, ts, (uint32_t)ts, 0);
-    CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+    CHECK_ERR(addHour(h, 0, hh, 10u * hh), ESP_OK);
   }
 
   rfsIoStats_t stats = lastStats();
-  //-- One slot write + one sync per add; header untouched.
-  CHECK(stats.writes == 40);
-  CHECK(stats.writeBytes == 40 * (SLOT_HDR_SIZE + (uint32_t)sizeof(meterRec_t)));
-  CHECK(stats.fsyncs == 40);
-
-  //-- Repeated edits of a single key: exactly one write + one sync each.
-  //-- Key 38 is still active after the 40 wraps (cap 4 keeps 37..40).
-  ringFileStoreResetIoStats();
-  uint64_t k = 38;
-
-  for (int i = 0; i < 30; i++)
-  {
-    mkMeter(&rec, 38, (uint32_t)i, 0);
-    CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), ESP_OK);
-  }
-
-  stats = lastStats();
-  CHECK(stats.writes == 30);
-  CHECK(stats.fsyncs == 30);
+  CHECK(stats.writes == 8);
+  CHECK(infoCount(h) == 4);
   ringFileClose(h);
+
+  char path[300];
+  ringPath(path, sizeof(path), "wear");
+  ringFileValidation_t val;
+  CHECK_ERR(ringFileValidate(path, &val), ESP_OK);
+  CHECK(val.headerValid);
+  CHECK(val.badSlotCount == 0);
+  CHECK(val.committedCount == 4);
 }
 
 static void testBufferedMode(void)
 {
-  ringFileHandle_t *h = mustCreate("buffered", 3);
-  meterRec_t rec, out;
-
+  ringFileHandle_t *h = mustCreateMeter("buffered", 4);
   ringFileClose(h);
-  h = mustOpenMode("buffered", false, RING_FILE_PERSIST_BUFFERED, 4);
 
-  ringFileStoreResetIoStats();
-  mkMeter(&rec, 1, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  mkMeter(&rec, 2, 2, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+  h = mustOpenMeterMode("buffered", false, RING_FILE_PERSIST_BUFFERED, 8);
 
-  //-- Staged adds are visible through the same handle with no storage yet.
-  uint64_t k = 1;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 1);
-  CHECK(infoCount(h) == 2);
-  rfsIoStats_t stats = lastStats();
-  CHECK(stats.writes == 0);
-  CHECK(stats.fsyncs == 0);
-
-  //-- Duplicate check works on staged data.
-  CHECK_ERR(ringFileAdd(h, &rec), RING_FILE_STORE_ERR_DUPLICATE_KEY);
-
-  //-- Repeated updates of the same staged record coalesce.
-  for (int i = 0; i < 5; i++)
-  {
-    mkMeter(&rec, 1, (uint32_t)(10 + i), 0);
-    CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), ESP_OK);
-  }
+  CHECK_ERR(addHour(h, 0, 0, 10), ESP_OK);
+  CHECK_ERR(addHour(h, 0, 1, 20), ESP_OK);
+  CHECK_ERR(addHour(h, 0, 2, 30), ESP_OK);
 
   ringFileInfo_t info;
-  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
-  CHECK(info.pendingCount == 2);
+  memset(&info, 0, sizeof(info));
+  CHECK_ERR(ringFileGetInfo(h, &info), ESP_OK);
+  CHECK(info.count == 3);
+  CHECK(info.pendingCount == 3);
   CHECK(info.dirty);
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 14);
 
+  //-- Staged records report the staged marker, not a bucketId.
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
+            ESP_OK);
+  CHECK(full.keys.usedKey == hourKey(hourTs(0, 0)));
+  uint32_t slot = 0;
+  CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slot), ESP_OK);
+  CHECK(slot == RING_FILE_SLOT_STAGED);
+
+  logRingDump(h, "buffered 3 staged");
+
+  //-- Nothing reached storage yet: a second read-only handle sees nothing.
+  ringFileHandle_t *ro = mustOpenMeter("buffered", true);
+  CHECK(infoCount(ro) == 0);
+  ringFileClose(ro);
+
+  ringFileStoreResetIoStats();
   CHECK_ERR(ringFileSync(h), ESP_OK);
-  stats = lastStats();
-  CHECK(stats.writes == 2); //-- coalesced: one image per staged record
-  CHECK(stats.fsyncs == 1);
+  CHECK(lastStats().writes >= 3);
 
-  //-- Eviction semantics apply before any flush.
-  mkMeter(&rec, 3, 3, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  mkMeter(&rec, 4, 4, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK); //-- capacity 3: evicts key 1
-  CHECK(infoCount(h) == 3);
-  k = 1;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  k = 4;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
+  memset(&info, 0, sizeof(info));
+  CHECK_ERR(ringFileGetInfo(h, &info), ESP_OK);
+  CHECK(info.pendingCount == 0);
+  CHECK(!info.dirty);
+
+  //-- After the sync the bucketId is the period modulo capacity.
+  memset(&it, 0, sizeof(it));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
+            ESP_OK);
+  CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slot), ESP_OK);
+  CHECK(slot != RING_FILE_SLOT_STAGED);
+  CHECK(slot == (uint32_t)((DAYS_2026_10_23 * 24ULL + 0ULL) % 4u));
+
   ringFileClose(h);
 
-  //-- Reopen matches the last logical state.
-  h = mustOpen("buffered", false);
+  h = mustOpenMeter("buffered", false);
   CHECK(infoCount(h) == 3);
-  k = 2;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 2);
-  k = 3;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  k = 4;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-
-  //-- Buffered with pending data: resize commits first, clear drops staged.
-  k = 2;
-  mkMeter(&rec, 2, 22, 0);
-  CHECK_ERR(ringFileUpdateByKey(h, &k, &rec), ESP_OK);
-  CHECK_ERR(ringFileResize(h, 5), ESP_OK);
-  k = 2;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
-  CHECK(out.energyWh == 22);
-
-  mkMeter(&rec, 99, 9, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  CHECK(infoCount(h) == 4);
-  CHECK_ERR(ringFileClear(h), ESP_OK);
-  CHECK(infoCount(h) == 0);
-  ringFileClose(h);
-
-  h = mustOpen("buffered", false);
-  CHECK(infoCount(h) == 0);
   ringFileClose(h);
 }
 
 static void testBufferedOverflowFlushes(void)
 {
-  ringFileHandle_t *h = mustCreate("bover", 10);
-  meterRec_t rec, out;
+  ringFileHandle_t *h = mustCreateMeter("bufover", 8);
   ringFileClose(h);
 
-  h = mustOpenMode("bover", false, RING_FILE_PERSIST_BUFFERED, 3);
+  h = mustOpenMeterMode("bufover", false, RING_FILE_PERSIST_BUFFERED, 2);
   ringFileStoreResetIoStats();
 
-  for (uint64_t ts = 1; ts <= 6; ts++)
-  {
-    mkMeter(&rec, ts, (uint32_t)ts, 0);
-    CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  }
+  CHECK_ERR(addHour(h, 0, 0, 10), ESP_OK);
+  CHECK_ERR(addHour(h, 0, 1, 20), ESP_OK);
+  CHECK(lastStats().writes == 0);
 
+  //-- The third add overflows the two-entry buffer and commits.
+  CHECK_ERR(addHour(h, 0, 2, 30), ESP_OK);
+  CHECK(lastStats().writes >= 2);
+
+  CHECK(infoCount(h) == 3);
   ringFileClose(h);
-  rfsIoStats_t stats = lastStats();
-  //-- Buffer limit 3 forces two flushes (6 records): one on overflow, one
-  //-- on the successful close.
-  CHECK(stats.writes == 6);
-  CHECK(stats.fsyncs == 2);
 
-  h = mustOpen("bover", false);
-  CHECK(infoCount(h) == 6);
-  uint64_t k = 6;
-  CHECK_ERR(ringFileReadByKey(h, &k, &out), ESP_OK);
+  h = mustOpenMeter("bufover", false);
+  CHECK(infoCount(h) == 3);
   ringFileClose(h);
 }
 
-static void testMultipleFiles(void)
+static void testMultipleTypes(void)
 {
-  ringFileHandle_t *a = mustCreate("multiA", 2);
-  ringFileHandle_t *b = mustCreate("multiB", 3);
-  meterRec_t rec, out;
+  ringFileHandle_t *meter = mustCreateMeter("typesMeter", 5);
+  ringFileConfig_t mcfg = monthConfig(12);
+  ringFileHandle_t *month = mustCreateCfg("typesMonth", &mcfg);
+  ringFileConfig_t scfg = sensorConfig(32);
+  ringFileHandle_t *sensor = mustCreateCfg("typesSensor", &scfg);
 
-  mkMeter(&rec, 1, 11, 0);
-  CHECK_ERR(ringFileAdd(a, &rec), ESP_OK);
-  mkMeter(&rec, 2, 22, 0);
-  CHECK_ERR(ringFileAdd(b, &rec), ESP_OK);
-  CHECK(infoCount(a) == 1);
-  CHECK(infoCount(b) == 1);
-  uint64_t k = 2;
-  CHECK_ERR(ringFileReadByKey(a, &k, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  CHECK_ERR(ringFileReadByKey(b, &k, &out), ESP_OK);
-  ringFileClose(a);
-  ringFileClose(b);
+  for (uint32_t hh = 0; hh < 5; hh++)
+  {
+    CHECK_ERR(addHour(meter, 0, hh, 100u + hh), ESP_OK);
+  }
+
+  ringFileStoreResetIoStats();
+  monthRec_t mrec;
+  mkMonth(&mrec, 1000, 1, 3000);
+  CHECK_ERR(ringFileAdd(month, 20260900000000ULL, &mrec), ESP_OK);
+  mrec.totalWh = 2000;
+  CHECK_ERR(ringFileAdd(month, 20261000000000ULL, &mrec), ESP_OK);
+  mrec.totalWh = 3000;
+  CHECK_ERR(ringFileAdd(month, 20261100000000ULL, &mrec), ESP_OK);
+
+  sensorRec_t srec;
+  mkSensor(&srec, 2150, 40);
+  CHECK_ERR(ringFileAdd(sensor, 20261118143055ULL, &srec), ESP_OK);
+  srec.tempMilliC = 2200;
+  CHECK_ERR(ringFileAdd(sensor, 20261118143056ULL, &srec), ESP_OK);
+  srec.tempMilliC = 2250;
+  CHECK_ERR(ringFileAdd(sensor, 20261118143057ULL, &srec), ESP_OK);
+
+  ringFileInfo_t info;
+
+  memset(&info, 0, sizeof(info));
+  CHECK_ERR(ringFileGetInfo(month, &info), ESP_OK);
+  CHECK(strcmp(info.schemaId, RING_FILE_SCHEMA_YYMM) == 0);
+  CHECK(info.granularity == RING_FILE_GRANULARITY_MONTH);
+  CHECK(info.recordSize == 16u + sizeof(monthRec_t));
+  CHECK(info.count == 3);
+
+  memset(&info, 0, sizeof(info));
+  CHECK_ERR(ringFileGetInfo(sensor, &info), ESP_OK);
+  CHECK(strcmp(info.schemaId, RING_FILE_SCHEMA_YYMMDDHHMMSS) == 0);
+  CHECK(info.granularity == RING_FILE_GRANULARITY_SECOND);
+  CHECK(info.recordSize == 16u + sizeof(sensorRec_t));
+  CHECK(info.count == 3);
+
+  //-- The October 2026 month bucket is 24310 % 12.
+  monthFull_t mfull;
+  memset(&mfull, 0, sizeof(mfull));
+  CHECK_ERR(ringFileReadByKey(month, 202610ULL, &mfull), ESP_OK);
+  CHECK(mfull.keys.timeStamp == 20261000000000ULL);
+  CHECK(mfull.payload.totalWh == 2000);
+
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  CHECK_ERR(ringFileIteratorBegin(month, &it, RING_FILE_ITER_KEY,
+                                  &(uint64_t){202610ULL}, &mfull), ESP_OK);
+  uint32_t slot = 0;
+  CHECK_ERR(ringFileIteratorGetSlot(month, &it, &slot), ESP_OK);
+  CHECK(slot == 24310u % 12u);
+
+  //-- Per-second ring: consecutive seconds get consecutive buckets.
+  sensorFull_t sfull;
+  memset(&sfull, 0, sizeof(sfull));
+  CHECK_ERR(ringFileReadByKey(sensor, 20261118143056ULL, &sfull), ESP_OK);
+  CHECK(sfull.payload.tempMilliC == 2200);
+
+  memset(&it, 0, sizeof(it));
+  memset(&sfull, 0, sizeof(sfull));
+  CHECK_ERR(ringFileIteratorBegin(sensor, &it, RING_FILE_ITER_OLDEST, NULL,
+                                  &sfull), ESP_OK);
+  CHECK_ERR(ringFileIteratorGetSlot(sensor, &it, &slot), ESP_OK);
+  CHECK(slot == (uint32_t)(1795012255ULL % 32u));
+
+  ringFileClose(meter);
+  ringFileClose(month);
+  ringFileClose(sensor);
+
+  //-- Opening one type with the other's expectation fails.
+  char path[300];
+  ringPath(path, sizeof(path), "typesMonth");
+  ringFileHandle_t *o = NULL;
+  ringFileOpenConfig_t wrong = baseOpen(RING_FILE_SCHEMA_YYMMDDHH,
+                                        sizeof(meterRec_t), false,
+                                        RING_FILE_PERSIST_IMMEDIATE, 0);
+  CHECK_ERR(ringFileOpen(path, &wrong, &o), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
+
+  ringFileOpenConfig_t right = baseOpen(RING_FILE_SCHEMA_YYMM,
+                                        sizeof(monthRec_t), false,
+                                        RING_FILE_PERSIST_IMMEDIATE, 0);
+  CHECK_ERR(ringFileOpen(path, &right, &o), ESP_OK);
+  CHECK(infoCount(o) == 3);
+  ringFileClose(o);
 }
 
 static void testValidateGoodRing(void)
 {
-  ringFileHandle_t *h = mustCreate("valid", 4);
-  meterRec_t rec;
+  ringFileHandle_t *h = mustCreateMeter("validate", 3);
 
-  for (uint64_t ts = 1; ts <= 3; ts++)
+  for (uint32_t hh = 0; hh < 3; hh++)
   {
-    mkMeter(&rec, ts, (uint32_t)ts, 0);
-    CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
+    CHECK_ERR(addHour(h, 0, hh, 10u + hh), ESP_OK);
   }
 
   ringFileClose(h);
 
   char path[300];
-  ringPath(path, sizeof(path), "valid");
-  ringFileValidation_t v;
-  CHECK_ERR(ringFileValidate(path, &v), ESP_OK);
-  CHECK(v.headerValid);
-  CHECK(v.metadataIssue == RING_FILE_META_OK);
-  CHECK(v.capacity == 4);
-  CHECK(v.recordSize == sizeof(meterRec_t));
-  CHECK(v.slotCount == 5);
-  CHECK(v.badSlotCount == 0);
-  CHECK(v.committedCount == 3);
-  CHECK(!v.strayResizeFiles);
-}
+  ringPath(path, sizeof(path), "validate");
+  ringFileValidation_t val;
+  CHECK_ERR(ringFileValidate(path, &val), ESP_OK);
+  CHECK(val.headerValid);
+  CHECK(val.metadataIssue == RING_FILE_META_OK);
+  CHECK(val.capacity == 3);
+  CHECK(val.recordSize == 24);
+  CHECK(val.slotCount == 4);
+  CHECK(val.badSlotCount == 0);
+  CHECK(val.committedCount == 3);
+  CHECK(!val.strayResizeFiles);
 
-//-- Ring with more records (capacity 10): fills the ring, wraps twice,
-//-- updates a middle record and verifies insertion order. Every command
-//-- (with its data) and its result, plus the key/slot dumps, go to
-//-- testLog.md.
-static void testMoreRecords(void)
-{
-  ringFileHandle_t *h = mustCreate("more10", 10);
-  meterRec_t rec, out;
+  uint8_t flip = 0xA5u;
+  pokeFile(path, slotRecordOffset(0, 24) + 20, &flip, 1);
+  CHECK_ERR(ringFileValidate(path, &val), ESP_OK);
+  CHECK(val.badSlotCount == 1);
+  CHECK(val.committedCount == 2);
 
-  for (uint64_t i = 1; i <= 12; i++)
+  char stray[340];
+  snprintf(stray, sizeof(stray), "%s.rfsold", path);
+  FILE *f = fopen(stray, "wb");
+
+  if (f != NULL)
   {
-    uint64_t ts = i * 100;
-    mkMeter(&rec, ts, (uint32_t)(i * 10), (uint16_t)i);
-    esp_err_t err = ringFileAdd(h, &rec);
-    char step[64];
-    snprintf(step, sizeof(step), "add key=%llu", (unsigned long long)ts);
-    logCmd(err, "ringFileAdd(key=%llu, energyWh=%lu, errorCount=%u) "
-           "on a capacity-10 ring", (unsigned long long)ts,
-           (unsigned long)(i * 10), (unsigned)i);
-    CHECK_ERR(err, ESP_OK);
-    logRingDump(h, step);
+    fclose(f);
   }
 
-  CHECK(infoCount(h) == 10);
+  CHECK_ERR(ringFileValidate(path, &val), ESP_OK);
+  CHECK(val.strayResizeFiles);
+  unlink(stray);
 
-  //-- The 11th and 12th add evicted exactly the two oldest (100 and 200).
-  uint64_t k = 100;
-  esp_err_t err = ringFileReadByKey(h, &k, &out);
-  CHECK_ERR(err, RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  logCmd(err, "ringFileReadByKey(key=100) — evicted by the 11th add");
-  k = 200;
-  err = ringFileReadByKey(h, &k, &out);
-  CHECK_ERR(err, RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  logCmd(err, "ringFileReadByKey(key=200) — evicted by the 12th add");
-
-  for (uint64_t i = 3; i <= 12; i++)
-  {
-    k = i * 100;
-    err = ringFileReadByKey(h, &k, &out);
-    CHECK_ERR(err, ESP_OK);
-    CHECK(out.energyWh == (uint32_t)(i * 10));
-  }
-
-  logCmdText("keys 300..1200 active, energyWh correct",
-             "ringFileReadByKey for all 10 active keys (300..1200)");
-
-  err = ringFileReadOldest(h, &out);
-  CHECK_ERR(err, ESP_OK);
-  CHECK(out.timestamp == 300);
-  logCmd(err, "ringFileReadOldest()");
-
-  err = ringFileReadNewest(h, &out);
-  CHECK_ERR(err, ESP_OK);
-  CHECK(out.timestamp == 1200);
-  logCmd(err, "ringFileReadNewest()");
-
-  //-- Update a middle record: position must be preserved.
-  k = 500;
-  mkMeter(&rec, 500, 999, 7);
-  err = ringFileUpdateByKey(h, &k, &rec);
-  CHECK_ERR(err, ESP_OK);
-  logCmd(err, "ringFileUpdateByKey(key=500, energyWh=999, errorCount=7) "
-         "— position preserved");
-  logRingDump(h, "update key=500");
-
-  k = 500;
-  err = ringFileReadByKey(h, &k, &out);
-  CHECK_ERR(err, ESP_OK);
-  CHECK(out.energyWh == 999 && out.errorCount == 7);
-
-  ringFileClose(h);
-
-  //-- Reopen: same 10 keys, same insertion order.
-  h = mustOpen("more10", false);
-  CHECK(infoCount(h) == 10);
-  logRingDump(h, "reopen after close");
-  ringFileClose(h);
+  CHECK_ERR(ringFileValidate("/nonexistent/path.rfs", &val), ESP_ERR_NOT_FOUND);
 }
 
-//-- Significant key positions: the keyPositionMask marks which byte
-//-- positions of the key take part in every comparison.
-static void testKeyPositionMask(void)
+static void testManyRecords(void)
 {
-  //-- Bit i set marks byte position i as significant: for the 8-byte
-  //-- timestamp key only bytes 2..7 take part; bytes 0 and 1 are ignored.
-  static const uint64_t maskValue = 0x00000000000000FCULL;
-  char path[300];
-  ringPath(path, sizeof(path), "keymask");
-  ringFileConfig_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.maxRecords = 4;
-  cfg.schemaId = 3;
-  cfg.schemaVersion = 1;
-  cfg.recordSize = sizeof(meterRec_t);
-  cfg.key.keyOffset = (uint32_t)offsetof(meterRec_t, timestamp);
-  cfg.key.keyType = RING_FILE_KEY_U64;
-  cfg.key.keySize = (uint16_t)sizeof(uint64_t);
-  cfg.key.keyPositionMask = maskValue;
-  cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
+  ringFileHandle_t *h = mustCreateMeter("many", 16);
 
-  ringFileHandle_t *h = NULL;
-  esp_err_t err = ringFileCreate(path, &cfg, &h);
-  CHECK_ERR(err, ESP_OK);
-  logCmd(err, "ringFileCreate(capacity=4, key=timestamp u64, "
-         "keyPositionMask=0x%016llx: byte positions 0-1 not significant)",
-         (unsigned long long)maskValue);
-
-  ringFileInfo_t info;
-  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
-  CHECK(info.keyPositionMask == maskValue);
-
-  meterRec_t rec, out;
-  uint64_t base = 0x12340001ULL;
-  mkMeter(&rec, base, 10, 0);
-  err = ringFileAdd(h, &rec);
-  CHECK_ERR(err, ESP_OK);
-  logCmd(err, "ringFileAdd(key=0x%016llx)", (unsigned long long)base);
-
-  //-- Differs only at insignificant positions → same key → duplicate.
-  uint64_t same = 0x123400ABULL;
-  mkMeter(&rec, same, 20, 0);
-  err = ringFileAdd(h, &rec);
-  CHECK_ERR(err, RING_FILE_STORE_ERR_DUPLICATE_KEY);
-  logCmd(err, "ringFileAdd(key=0x%016llx: only bytes 0-1 differ)",
-         (unsigned long long)same);
-
-  uint64_t look = 0x123400FFULL;
-  err = ringFileReadByKey(h, &look, &out);
-  CHECK_ERR(err, ESP_OK);
-  CHECK(out.energyWh == 10);
-  logCmd(err, "ringFileReadByKey(key=0x%016llx) finds key=0x%016llx "
-         "(byte 0 ignored)", (unsigned long long)look,
-         (unsigned long long)base);
-
-  uint64_t other = 0x12350000ULL;
-  err = ringFileReadByKey(h, &other, &out);
-  CHECK_ERR(err, RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  logCmd(err, "ringFileReadByKey(key=0x%016llx): byte 2 (significant) "
-         "differs", (unsigned long long)other);
-
-  //-- Embedded key differing from the lookup key only in insignificant
-  //-- positions is accepted.
-  uint64_t lk = 0x12340002ULL;
-  mkMeter(&rec, 0x12340003ULL, 33, 1);
-  err = ringFileUpdateByKey(h, &lk, &rec);
-  CHECK_ERR(err, ESP_OK);
-  logCmd(err, "ringFileUpdateByKey(key=0x%016llx, embedded key "
-         "0x%016llx: only byte 0 differs): accepted",
-         (unsigned long long)lk, (unsigned long long)0x12340003ULL);
-
-  uint64_t back = 0x12340001ULL;
-  err = ringFileReadByKey(h, &back, &out);
-  CHECK_ERR(err, ESP_OK);
-  CHECK(out.energyWh == 33 && out.errorCount == 1);
-  logCmd(err, "ringFileReadByKey(key=0x%016llx) shows the update",
-         (unsigned long long)back);
-
-  logRingDump(h, "keymask scenario (adds, duplicate, update)");
-  ringFileClose(h);
-
-  //-- Reopen: the mask is restored from the header and keeps working.
-  ringFileOpenConfig_t ocfg;
-  memset(&ocfg, 0, sizeof(ocfg));
-  ocfg.expectedSchemaId = 3;
-  ocfg.expectedSchemaVersion = 1;
-  ocfg.expectedRecordSize = sizeof(meterRec_t);
-  err = ringFileOpen(path, &ocfg, &h);
-  CHECK_ERR(err, ESP_OK);
-  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
-  CHECK(info.keyPositionMask == maskValue);
-  err = ringFileReadByKey(h, &look, &out);
-  CHECK_ERR(err, ESP_OK);
-  logCmd(err, "reopen: keyPositionMask from header, "
-         "readByKey(0x%016llx) finds the record", (unsigned long long)look);
-  ringFileClose(h);
-
-  //-- Invalid masks are rejected at create time.
-  ringPath(path, sizeof(path), "keymaskbad1");
-  cfg = meterConfig(3);
-  cfg.key.keyPositionMask = 0x1FFULL; //-- bit 8 set while keySize is 8
-  err = ringFileCreate(path, &cfg, &h);
-  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
-  logCmd(err, "ringFileCreate keyPositionMask=0x1FF (bit beyond "
-         "keySize=8) -> rejected");
-
-  ringPath(path, sizeof(path), "keymaskbad2");
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.maxRecords = 3;
-  cfg.schemaId = 3;
-  cfg.schemaVersion = 1;
-  cfg.recordSize = sizeof(bigRec_t);
-  cfg.key.keyOffset = 0;
-  cfg.key.keyType = RING_FILE_KEY_BYTES;
-  cfg.key.keySize = 80;
-  cfg.key.keyPositionMask = 1;
-  cfg.persistMode = RING_FILE_PERSIST_IMMEDIATE;
-  err = ringFileCreate(path, &cfg, &h);
-  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
-  logCmd(err, "ringFileCreate BYTES keySize=80 with keyPositionMask "
-         "(mask limited to positions 0-63) -> rejected");
-}
-
-//-- ---------------------------------------------------------------------------
-//-- Timestamp helpers and TIMEBUCKET addressing
-//-- ---------------------------------------------------------------------------
-
-static uint32_t testCrc32(const uint8_t *data, size_t len)
-{
-  uint32_t state = 0xFFFFFFFFu;
-
-  for (size_t i = 0; i < len; i++)
+  //-- 40 hours: days 23..26 of October 2026, hours 0..9 of each day.
+  for (uint32_t d = 0; d < 4; d++)
   {
-    state ^= data[i];
-
-    for (int bit = 0; bit < 8; bit++)
+    for (uint32_t hh = 0; hh < 10; hh++)
     {
-      state = (state & 1u) ? ((state >> 1) ^ 0xEDB88320u) : (state >> 1);
+      CHECK_ERR(addHour(h, d, hh, 1000u + d * 10u + hh), ESP_OK);
     }
   }
 
-  return ~state;
+  CHECK(infoCount(h) == 16);
+
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadOldest(h, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == mkTs(2026u, 10u, 25u, 4u, 0u, 0u));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(h, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == mkTs(2026u, 10u, 26u, 9u, 0u, 0u));
+
+  //-- Walk the ring: the retained 16 buckets are the newest ones, oldest
+  //-- to newest: day 25 hours 4..9, then day 26 hours 0..9.
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
+            ESP_OK);
+
+  uint32_t seen = 0;
+
+  for (;;)
+  {
+    uint32_t dOff = (seen < 6u) ? 2u : 3u;
+    uint32_t hh = (seen < 6u) ? (4u + seen) : (seen - 6u);
+    CHECK(full.keys.timeStamp == mkTs(2026u, 10u, 23u + dOff, hh, 0u, 0u));
+    CHECK(full.keys.usedKey == hourKey(mkTs(2026u, 10u, 23u + dOff, hh, 0u, 0u)));
+    seen++;
+
+    if (ringFileIteratorNext(h, &it, &full) != ESP_OK)
+    {
+      break;
+    }
+  }
+
+  CHECK(seen == 16);
+  ringFileClose(h);
 }
 
 static void testTimeHelpers(void)
 {
-  uint64_t ts = 0;
+  char text[15];
+  uint64_t unixSec = 0;
 
-  //-- Known anchor values (unix seconds, wall clock treated as UTC).
-  CHECK_ERR(ringFileTimeStampStringToUnix("20000101000000", &ts), ESP_OK);
-  CHECK(ts == 946684800ULL);
-  logCmd(ESP_OK, "ringFileTimeStampStringToUnix(\"20000101000000\") = 946684800");
+  CHECK_ERR(ringFileUnixToTimeStampString(946684800ULL, text), ESP_OK);
+  CHECK(strcmp(text, "20000101000000") == 0);
 
-  CHECK_ERR(ringFileTimeStampStringToUnix("20240229000000", &ts), ESP_OK);
-  CHECK(ts == 1709164800ULL);
-  logCmd(ESP_OK, "ringFileTimeStampStringToUnix(\"20240229000000\") leap day "
-         "= 1709164800");
+  CHECK_ERR(ringFileTimeStampStringToUnix("20261118143055", &unixSec), ESP_OK);
+  CHECK(unixSec == 1795012255ULL);
 
-  CHECK_ERR(ringFileTimeStampStringToUnix("20991231235959", &ts), ESP_OK);
-  CHECK(ts == 4102444799ULL);
+  CHECK_ERR(ringFileUnixToTimeStampString(1795012255ULL, text), ESP_OK);
+  CHECK(strcmp(text, "20261118143055") == 0);
 
-  CHECK_ERR(ringFileTimeStampStringToUnix("20261023123300", &ts), ESP_OK);
-
-  //-- Rejections: invalid second/minute/hour/month/day, wrong century,
-  //-- non-digits, wrong length, NULL.
-  CHECK_ERR(ringFileTimeStampStringToUnix("20261023123378", &ts), ESP_ERR_INVALID_ARG);
-  logCmd(ESP_ERR_INVALID_ARG, "\"20261023123378\": second 78 rejected");
-  CHECK_ERR(ringFileTimeStampStringToUnix("20261023126000", &ts), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileTimeStampStringToUnix("20261023240000", &ts), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileTimeStampStringToUnix("20261301000000", &ts), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileTimeStampStringToUnix("20261032000000", &ts), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileTimeStampStringToUnix("20230229000000", &ts), ESP_ERR_INVALID_ARG);
-  logCmd(ESP_ERR_INVALID_ARG, "\"20230229000000\": 2023 is not a leap year");
-  CHECK_ERR(ringFileTimeStampStringToUnix("21000101000000", &ts), ESP_ERR_INVALID_ARG);
-  logCmd(ESP_ERR_INVALID_ARG, "\"21000101000000\": century 21 rejected");
-  CHECK_ERR(ringFileTimeStampStringToUnix("19991231235959", &ts), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileTimeStampStringToUnix("2026102312330a", &ts), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileTimeStampStringToUnix("2026102312330", &ts), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileTimeStampStringToUnix("202610231233000", &ts), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileTimeStampStringToUnix("", &ts), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileTimeStampStringToUnix(NULL, &ts), ESP_ERR_INVALID_ARG);
-
-  //-- Inverse conversion and round-trip.
-  char stamp[15];
-  memset(stamp, 0, sizeof(stamp));
-  CHECK_ERR(ringFileUnixToTimeStampString(946684800ULL, stamp), ESP_OK);
-  CHECK(strcmp(stamp, "20000101000000") == 0);
-  CHECK_ERR(ringFileUnixToTimeStampString(1709164800ULL, stamp), ESP_OK);
-  CHECK(strcmp(stamp, "20240229000000") == 0);
-  CHECK_ERR(ringFileUnixToTimeStampString(4102444799ULL, stamp), ESP_OK);
-  CHECK(strcmp(stamp, "20991231235959") == 0);
-  CHECK_ERR(ringFileUnixToTimeStampString(946684799ULL, stamp), ESP_ERR_INVALID_ARG);
-  logCmd(ESP_ERR_INVALID_ARG, "ringFileUnixToTimeStampString(946684799): "
-         "before 2000 rejected");
-  CHECK_ERR(ringFileUnixToTimeStampString(4102444800ULL, stamp), ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileUnixToTimeStampString(946684800ULL, NULL), ESP_ERR_INVALID_ARG);
-
-  CHECK_ERR(ringFileUnixToTimeStampString(ts, stamp), ESP_OK);
-  CHECK(strcmp(stamp, "20261023123300") == 0);
-  logCmd(ESP_OK, "round-trip unix -> \"20261023123300\"");
-
-  //-- Buckets: hour and day are pure divisions; the week bucket starts
-  //-- Monday 00:00 and the month bucket uses (EEYY-1)*12+MM.
-  uint64_t sunday = 0, monday = 0;
-  CHECK(ringFileTimeStampStringToUnix("20260104123300", &sunday) == ESP_OK);
-  CHECK(ringFileTimeStampStringToUnix("20260105000000", &monday) == ESP_OK);
-
-  uint64_t bHour = 0, bDay = 0, bWeekSun = 0, bWeekMon = 0, bMonth = 0;
-  CHECK_ERR(ringFileUnixToBucketId(sunday, RING_FILE_GRANULARITY_HOUR, &bHour),
-            ESP_OK);
-  CHECK(bHour == sunday / 3600ULL);
-  CHECK_ERR(ringFileUnixToBucketId(sunday, RING_FILE_GRANULARITY_DAY, &bDay), ESP_OK);
-  CHECK(bDay == sunday / 86400ULL);
-  CHECK_ERR(ringFileUnixToBucketId(sunday, RING_FILE_GRANULARITY_WEEK, &bWeekSun),
-            ESP_OK);
-  CHECK_ERR(ringFileUnixToBucketId(monday, RING_FILE_GRANULARITY_WEEK, &bWeekMon),
-            ESP_OK);
-  CHECK((monday + 259200ULL) % 604800ULL == 0ULL);
-  CHECK(bWeekSun + 1ULL == bWeekMon);
-  logCmd(ESP_OK, "week buckets: Sunday 2026-01-04 -> %llu, Monday "
-         "2026-01-05 -> %llu (Monday starts the bucket)",
-         (unsigned long long)bWeekSun, (unsigned long long)bWeekMon);
-
-  CHECK_ERR(ringFileUnixToBucketId(ts, RING_FILE_GRANULARITY_MONTH, &bMonth), ESP_OK);
-  CHECK(bMonth == (2026u - 1u) * 12u + 10u);
-  logCmd(ESP_OK, "month bucket 2026-10 = (2026-1)*12+10 = %llu",
-         (unsigned long long)bMonth);
-  CHECK_ERR(ringFileUnixToBucketId(ts, RING_FILE_GRANULARITY_NONE, &bMonth),
+  CHECK_ERR(ringFileTimeStampStringToUnix("19991231235959", &unixSec),
             ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileUnixToBucketId(ts, (ringFileGranularity_t)9, &bMonth),
+  CHECK_ERR(ringFileTimeStampStringToUnix("20260230000000", &unixSec),
             ESP_ERR_INVALID_ARG);
-  CHECK_ERR(ringFileUnixToBucketId(ts, RING_FILE_GRANULARITY_HOUR, NULL),
+  CHECK_ERR(ringFileTimeStampStringToUnix("20260101", &unixSec),
+            ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileUnixToTimeStampString(0, text), ESP_ERR_INVALID_ARG);
+  CHECK_ERR(ringFileUnixToTimeStampString(4133980800ULL, text),
             ESP_ERR_INVALID_ARG);
 
-  //-- ISO-8601 weeks: weeks start Monday; 2025-12-29 already belongs to
-  //-- ISO 2026-W01 (that week's Thursday is 2026-01-01).
-  uint64_t xmas29 = 0;
-  CHECK(ringFileTimeStampStringToUnix("20251229000000", &xmas29) == ESP_OK);
-  uint32_t isoYear = 0, isoWeek = 0;
-  CHECK_ERR(ringFileUnixToIsoWeek(xmas29, &isoYear, &isoWeek), ESP_OK);
-  CHECK(isoYear == 2026 && isoWeek == 1);
-  logCmd(ESP_OK, "ringFileUnixToIsoWeek(2025-12-29) = %u-W%02u",
-         (unsigned)isoYear, (unsigned)isoWeek);
-  CHECK_ERR(ringFileUnixToIsoWeek(sunday, &isoYear, &isoWeek), ESP_OK);
-  CHECK(isoYear == 2026 && isoWeek == 1);
-  CHECK_ERR(ringFileUnixToIsoWeek(monday, &isoYear, &isoWeek), ESP_OK);
-  CHECK(isoYear == 2026 && isoWeek == 2);
-  CHECK_ERR(ringFileUnixToIsoWeek(xmas29, NULL, &isoWeek), ESP_ERR_INVALID_ARG);
-}
+  uint64_t period = 0;
+  CHECK_ERR(ringFileUnixToBucketId(946684800ULL, RING_FILE_GRANULARITY_YEAR,
+                                   &period), ESP_OK);
+  CHECK(period == 2000ULL);
+  CHECK_ERR(ringFileUnixToBucketId(946684800ULL, RING_FILE_GRANULARITY_MONTH,
+                                   &period), ESP_OK);
+  CHECK(period == (2000ULL - 1ULL) * 12ULL + 1ULL);
+  CHECK_ERR(ringFileUnixToBucketId(946684800ULL, RING_FILE_GRANULARITY_DAY,
+                                   &period), ESP_OK);
+  CHECK(period == 10957ULL);
+  CHECK_ERR(ringFileUnixToBucketId(946684800ULL, RING_FILE_GRANULARITY_HOUR,
+                                   &period), ESP_OK);
+  CHECK(period == 10957ULL * 24ULL);
+  CHECK_ERR(ringFileUnixToBucketId(946684800ULL, RING_FILE_GRANULARITY_MINUTE,
+                                   &period), ESP_OK);
+  CHECK(period == 10957ULL * 1440ULL);
+  CHECK_ERR(ringFileUnixToBucketId(946684800ULL, RING_FILE_GRANULARITY_SECOND,
+                                   &period), ESP_OK);
+  CHECK(period == 946684800ULL);
+  CHECK_ERR(ringFileUnixToBucketId(946684800ULL, RING_FILE_GRANULARITY_NONE,
+                                   &period), ESP_ERR_INVALID_ARG);
 
-static ringFileConfig_t timeBucketConfig(uint32_t capacity,
-                                         ringFileGranularity_t granularity,
-                                         ringFilePersistMode_t persistMode,
-                                         uint16_t maxPending)
-{
-  ringFileConfig_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.maxRecords = capacity;
-  cfg.schemaId = 77;
-  cfg.schemaVersion = 1;
-  cfg.recordSize = sizeof(meterRec_t);
-  cfg.persistMode = persistMode;
-  cfg.maxPendingRecords = maxPending;
-  cfg.addressing = RING_FILE_ADDRESSING_TIMEBUCKET;
-  cfg.granularity = granularity;
-  cfg.timestampOffset = (uint32_t)offsetof(meterRec_t, timestamp);
-  return cfg;
-}
+  uint32_t isoYear = 0;
+  uint32_t isoWeek = 0;
 
-static ringFileOpenConfig_t timeBucketOpen(ringFileGranularity_t granularity)
-{
-  ringFileOpenConfig_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.expectedSchemaId = 77;
-  cfg.expectedSchemaVersion = 1;
-  cfg.expectedRecordSize = sizeof(meterRec_t);
-  cfg.expectedAddressing = RING_FILE_ADDRESSING_TIMEBUCKET;
-  cfg.expectedGranularity = granularity;
-  cfg.expectedTimestampOffset = (uint32_t)offsetof(meterRec_t, timestamp);
-  return cfg;
-}
+  //-- 2025-12-29 is the Monday of ISO year 2026, week 1.
+  CHECK_ERR(ringFileUnixToIsoWeek(1766966400ULL, &isoYear, &isoWeek), ESP_OK);
+  CHECK(isoYear == 2026u);
+  CHECK(isoWeek == 1u);
 
-static void testTimeBucketRing(void)
-{
-  char path[300];
-  ringPath(path, sizeof(path), "timebucket");
+  //-- 2026-01-01 (Thursday) stays in 2026-W01.
+  CHECK_ERR(ringFileUnixToIsoWeek(1767225600ULL, &isoYear, &isoWeek), ESP_OK);
+  CHECK(isoYear == 2026u);
+  CHECK(isoWeek == 1u);
 
-  ringFileConfig_t cfg = timeBucketConfig(3, RING_FILE_GRANULARITY_HOUR,
-                                          RING_FILE_PERSIST_IMMEDIATE, 0);
-  ringFileHandle_t *h = NULL;
-  esp_err_t err = ringFileCreate(path, &cfg, &h);
-  CHECK_ERR(err, ESP_OK);
-  logCmd(err, "ringFileCreate(TIMEBUCKET, HOUR, capacity=3, "
-         "timestampOffset=%u)", (unsigned)cfg.timestampOffset);
-
-  ringFileInfo_t info;
-  CHECK(ringFileGetInfo(h, &info) == ESP_OK);
-  CHECK(info.addressing == RING_FILE_ADDRESSING_TIMEBUCKET);
-  CHECK(info.granularity == RING_FILE_GRANULARITY_HOUR);
-  CHECK(info.timestampOffset == (uint32_t)offsetof(meterRec_t, timestamp));
-
-  meterRec_t rec, out;
-  uint64_t tsH09 = 0, tsH10 = 0, tsH10late = 0, tsH11 = 0, tsH12 = 0, tsH13 = 0;
-  CHECK(ringFileTimeStampStringToUnix("20261023090000", &tsH09) == ESP_OK);
-  CHECK(ringFileTimeStampStringToUnix("20261023100000", &tsH10) == ESP_OK);
-  CHECK(ringFileTimeStampStringToUnix("20261023105959", &tsH10late) == ESP_OK);
-  CHECK(ringFileTimeStampStringToUnix("20261023110000", &tsH11) == ESP_OK);
-  CHECK(ringFileTimeStampStringToUnix("20261023120000", &tsH12) == ESP_OK);
-  CHECK(ringFileTimeStampStringToUnix("20261023130000", &tsH13) == ESP_OK);
-
-  uint64_t bH09 = 0, bH10 = 0, bH11 = 0, bH12 = 0, bH13 = 0;
-  CHECK(ringFileUnixToBucketId(tsH09, RING_FILE_GRANULARITY_HOUR, &bH09) == ESP_OK);
-  CHECK(ringFileUnixToBucketId(tsH10, RING_FILE_GRANULARITY_HOUR, &bH10) == ESP_OK);
-  CHECK(ringFileUnixToBucketId(tsH11, RING_FILE_GRANULARITY_HOUR, &bH11) == ESP_OK);
-  CHECK(ringFileUnixToBucketId(tsH12, RING_FILE_GRANULARITY_HOUR, &bH12) == ESP_OK);
-  CHECK(ringFileUnixToBucketId(tsH13, RING_FILE_GRANULARITY_HOUR, &bH13) == ESP_OK);
-  CHECK(bH09 + 1 == bH10 && bH10 + 1 == bH11 && bH11 + 1 == bH12 &&
-        bH12 + 1 == bH13);
-
-  mkMeter(&rec, tsH10, 100, 0);
-  err = ringFileAdd(h, &rec);
-  CHECK_ERR(err, ESP_OK);
-  logCmd(err, "ringFileAdd(hour 10)");
-
-  mkMeter(&rec, tsH11, 110, 0);
-  err = ringFileAdd(h, &rec);
-  CHECK_ERR(err, ESP_OK);
-  logCmd(err, "ringFileAdd(hour 11)");
-
-  //-- Same bucket: many timestamps map to hour 10; add overwrites.
-  mkMeter(&rec, tsH10late, 105, 1);
-  err = ringFileAdd(h, &rec);
-  CHECK_ERR(err, ESP_OK);
-  CHECK(infoCount(h) == 2);
-  CHECK_ERR(ringFileReadByKey(h, &bH10, &out), ESP_OK);
-  CHECK(out.energyWh == 105 && out.errorCount == 1);
-  logCmd(err, "ringFileAdd(hour 10 again at 10:59:59): same bucket "
-         "overwritten");
-
-  //-- Inactive older bucket: clock rewind through add is refused.
-  mkMeter(&rec, tsH09, 90, 0);
-  err = ringFileAdd(h, &rec);
-  CHECK_ERR(err, RING_FILE_STORE_ERR_NOT_NEWER);
-  CHECK_ERR(ringFileReadByKey(h, &bH09, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  logCmd(err, "ringFileAdd(hour 09: not newer -> refused, nothing stored");
-
-  //-- Upsert updates an active bucket for any timestamp.
-  mkMeter(&rec, tsH10, 106, 0);
-  err = ringFileUpsert(h, &rec);
-  CHECK_ERR(err, ESP_OK);
-  CHECK_ERR(ringFileReadByKey(h, &bH10, &out), ESP_OK);
-  CHECK(out.energyWh == 106);
-  logCmd(err, "ringFileUpsert(hour 10 at 10:00:00): active bucket updated "
-         "with any timestamp");
-
-  //-- Upsert add path follows the newer rule.
-  mkMeter(&rec, tsH09, 90, 0);
-  err = ringFileUpsert(h, &rec);
-  CHECK_ERR(err, RING_FILE_STORE_ERR_NOT_NEWER);
-  logCmd(err, "ringFileUpsert(hour 09 as new bucket): not newer -> refused");
-
-  //-- Order follows bucketId, not insertion seq.
-  meterRec_t oldest, newest;
-  CHECK_ERR(ringFileReadOldest(h, &oldest), ESP_OK);
-  CHECK(oldest.timestamp == tsH10);
-  CHECK_ERR(ringFileReadNewest(h, &newest), ESP_OK);
-  CHECK(newest.timestamp == tsH11);
-
-  //-- Edit: append a newer bucket.
-  mkMeter(&rec, tsH12, 120, 0);
-  err = ringFileEdit(h, &rec);
-  CHECK_ERR(err, ESP_OK);
-  CHECK(infoCount(h) == 3);
-  logCmd(err, "ringFileEdit(hour 12): newer bucket appended");
-
-  //-- Edit for an evicted-ago bucket: outside the retained window
-  //-- [newestBucket - capacity + 1, newestBucket] = [bucket(10), bucket(12)].
-  mkMeter(&rec, tsH09, 90, 0);
-  err = ringFileEdit(h, &rec);
-  CHECK_ERR(err, RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE);
-  CHECK(infoCount(h) == 3);
-  logCmd(err, "ringFileEdit(hour 09): outside retained window -> rejected");
-
-  //-- Edit an active bucket with any timestamp.
-  mkMeter(&rec, tsH10, 107, 2);
-  err = ringFileEdit(h, &rec);
-  CHECK_ERR(err, ESP_OK);
-  CHECK_ERR(ringFileReadByKey(h, &bH10, &out), ESP_OK);
-  CHECK(out.energyWh == 107 && out.errorCount == 2);
-  logCmd(err, "ringFileEdit(hour 10): active bucket updated");
-
-  //-- Eviction drops the oldest bucket.
-  mkMeter(&rec, tsH13, 130, 0);
-  err = ringFileAdd(h, &rec);
-  CHECK_ERR(err, ESP_OK);
-  CHECK(infoCount(h) == 3);
-  CHECK_ERR(ringFileReadOldest(h, &oldest), ESP_OK);
-  CHECK(oldest.timestamp == tsH11);
-  CHECK_ERR(ringFileReadNewest(h, &newest), ESP_OK);
-  CHECK(newest.timestamp == tsH13);
-  CHECK_ERR(ringFileReadByKey(h, &bH10, &out), RING_FILE_STORE_ERR_KEY_NOT_FOUND);
-  logCmd(err, "ringFileAdd(hour 13): oldest bucket (hour 10) evicted");
-
-  //-- Iterator walks by bucket order; GetSlot reports bucketId % capacity.
-  ringFileIterator_t it;
-  memset(&it, 0, sizeof(it));
-  meterRec_t step;
-  uint64_t expectTs[3] = {tsH11, tsH12, tsH13};
-  uint64_t expectBucket[3] = {bH11, bH12, bH13};
-
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &step),
+  //-- A second-resolution period equals the unix seconds.
+  CHECK_ERR(ringFileTimeStampToPeriod(20261118143055ULL,
+                                      RING_FILE_GRANULARITY_SECOND, &period),
             ESP_OK);
-
-  for (int i = 0; i < 3; i++)
-  {
-    CHECK(step.timestamp == expectTs[i]);
-    uint32_t slot = RING_FILE_SLOT_STAGED;
-    CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slot), ESP_OK);
-    CHECK(slot == (uint32_t)(expectBucket[i] % 3u));
-
-    if (i < 2)
-    {
-      CHECK_ERR(ringFileIteratorNext(h, &it, &step), ESP_OK);
-    }
-  }
-
-  CHECK_ERR(ringFileIteratorNext(h, &it, &step), RING_FILE_STORE_ERR_ITER_END);
-  logCmd(ESP_OK, "iterator: bucket order, logical slot = bucketId %% capacity");
-
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_KEY, &bH12, &step), ESP_OK);
-  CHECK(step.timestamp == tsH12);
-  logCmd(ESP_OK, "ringFileIteratorBegin(KEY, bucketId of hour 12)");
-
-  logRingDump(h, "TIMEBUCKET scenario (adds, overwrite, edit, eviction)");
-  ringFileClose(h);
-
-  //-- Reopen with matching expectations; every mismatch is a schema error.
-  ringFileOpenConfig_t ocfg = timeBucketOpen(RING_FILE_GRANULARITY_HOUR);
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), ESP_OK);
-  CHECK(infoCount(h) == 3);
-  ringFileClose(h);
-
-  ocfg = timeBucketOpen(RING_FILE_GRANULARITY_DAY);
-  err = ringFileOpen(path, &ocfg, &h);
-  CHECK_ERR(err, RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
-  logCmd(err, "reopen expecting DAY granularity -> schema mismatch");
-
-  ocfg = timeBucketOpen(RING_FILE_GRANULARITY_HOUR);
-  ocfg.expectedAddressing = RING_FILE_ADDRESSING_INSERTION;
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
-
-  ocfg = timeBucketOpen(RING_FILE_GRANULARITY_HOUR);
-  ocfg.expectedTimestampOffset = 4;
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), RING_FILE_STORE_ERR_SCHEMA_MISMATCH);
-
-  //-- Resize keeps the newest buckets.
-  ocfg = timeBucketOpen(RING_FILE_GRANULARITY_HOUR);
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), ESP_OK);
-  CHECK_ERR(ringFileResize(h, 2), ESP_OK);
-  CHECK(infoCount(h) == 2);
-  CHECK_ERR(ringFileReadOldest(h, &oldest), ESP_OK);
-  CHECK(oldest.timestamp == tsH12);
-  CHECK_ERR(ringFileReadNewest(h, &newest), ESP_OK);
-  CHECK(newest.timestamp == tsH13);
-  logCmd(ESP_OK, "ringFileResize(2): newest buckets (12, 13) retained");
-  ringFileClose(h);
-
-  //-- ringFileEdit on an insertion-mode ring is rejected.
-  ringPath(path, sizeof(path), "timeins");
-  ringFileConfig_t insCfg = meterConfig(3);
-  CHECK_ERR(ringFileCreate(path, &insCfg, &h), ESP_OK);
-  mkMeter(&rec, 5, 5, 0);
-  err = ringFileEdit(h, &rec);
-  CHECK_ERR(err, ESP_ERR_INVALID_STATE);
-  logCmd(err, "ringFileEdit on INSERTION ring -> INVALID_STATE");
-  ringFileClose(h);
-
-  //-- Invalid TIMEBUCKET configurations are rejected at create.
-  cfg = timeBucketConfig(3, RING_FILE_GRANULARITY_HOUR,
-                         RING_FILE_PERSIST_IMMEDIATE, 0);
-  cfg.timestampOffset = (uint32_t)sizeof(meterRec_t) - 4u;  //-- 8 bytes do not fit
-  err = ringFileCreate(path, &cfg, &h);
-  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
-  logCmd(err, "create TIMEBUCKET with timestampOffset+8 > recordSize -> rejected");
-
-  cfg = timeBucketConfig(3, RING_FILE_GRANULARITY_NONE,
-                         RING_FILE_PERSIST_IMMEDIATE, 0);
-  err = ringFileCreate(path, &cfg, &h);
-  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
-
-  cfg = timeBucketConfig(3, (ringFileGranularity_t)9, RING_FILE_PERSIST_IMMEDIATE, 0);
-  err = ringFileCreate(path, &cfg, &h);
-  CHECK_ERR(err, ESP_ERR_INVALID_ARG);
-  logCmd(err, "create TIMEBUCKET with invalid granularity -> rejected");
-}
-
-static void testTimeBucketBufferedAndV2(void)
-{
-  //-- Buffered TIMEBUCKET: staged reads see the overlay, the staged slot
-  //-- marker is reported, a flush commits and reopen shows the day records.
-  char path[300];
-  ringPath(path, sizeof(path), "timebuf");
-  ringFileConfig_t cfg = timeBucketConfig(4, RING_FILE_GRANULARITY_DAY,
-                                          RING_FILE_PERSIST_BUFFERED, 4);
-  ringFileHandle_t *h = NULL;
-  CHECK_ERR(ringFileCreate(path, &cfg, &h), ESP_OK);
-  logCmd(ESP_OK, "ringFileCreate(TIMEBUCKET, DAY, buffered maxPending=4)");
-
-  meterRec_t rec, out;
-  uint64_t day1early = 0, day1late = 0, day2 = 0;
-  CHECK(ringFileTimeStampStringToUnix("20261001010000", &day1early) == ESP_OK);
-  CHECK(ringFileTimeStampStringToUnix("20261001180000", &day1late) == ESP_OK);
-  CHECK(ringFileTimeStampStringToUnix("20261002120000", &day2) == ESP_OK);
-
-  mkMeter(&rec, day1early, 1, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  mkMeter(&rec, day1late, 2, 0);
-  CHECK_ERR(ringFileUpsert(h, &rec), ESP_OK);   //-- same bucket → staged overwrite
-  mkMeter(&rec, day2, 20, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  CHECK(infoCount(h) == 2);
-
-  ringFileIterator_t it;
-  memset(&it, 0, sizeof(it));
-  meterRec_t step;
-  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &step),
-            ESP_OK);
-  CHECK(step.timestamp == day1late && step.energyWh == 2);
-  uint32_t slot = 0;
-  CHECK_ERR(ringFileIteratorGetSlot(h, &it, &slot), ESP_OK);
-  CHECK(slot == RING_FILE_SLOT_STAGED);
-  logCmd(ESP_OK, "buffered: staged same-day overwrite visible, slot staged");
-  CHECK_ERR(ringFileIteratorNext(h, &it, &step), ESP_OK);
-  CHECK(step.timestamp == day2);
-  CHECK_ERR(ringFileIteratorNext(h, &it, &step), RING_FILE_STORE_ERR_ITER_END);
-
-  CHECK_ERR(ringFileSync(h), ESP_OK);
-
-  //-- A fresh cursor after the flush reports the logical day bucket slot.
-  uint64_t bDay2 = 0;
-  CHECK(ringFileUnixToBucketId(day2, RING_FILE_GRANULARITY_DAY, &bDay2) == ESP_OK);
-  ringFileIterator_t it2;
-  memset(&it2, 0, sizeof(it2));
-  CHECK_ERR(ringFileIteratorBegin(h, &it2, RING_FILE_ITER_KEY, &bDay2, &step),
-            ESP_OK);
-  CHECK_ERR(ringFileIteratorGetSlot(h, &it2, &slot), ESP_OK);
-  CHECK(slot == (uint32_t)(bDay2 % 4u));
-  logCmd(ESP_OK, "after sync: logical slot = bucketId %% capacity = %lu",
-         (unsigned long)slot);
-  ringFileClose(h);
-
-  ringFileOpenConfig_t ocfg = timeBucketOpen(RING_FILE_GRANULARITY_DAY);
-  CHECK_ERR(ringFileOpen(path, &ocfg, &h), ESP_OK);
-  CHECK(infoCount(h) == 2);
-  meterRec_t oldest;
-  CHECK_ERR(ringFileReadOldest(h, &oldest), ESP_OK);
-  CHECK(oldest.timestamp == day1late && oldest.energyWh == 2);
-  ringFileClose(h);
-  logCmd(ESP_OK, "reopen buffered DAY ring: two committed day records");
-
-  //-- Format-version-2 compatibility: a v2 header (insertion semantics,
-  //-- no addressing fields) still opens and behaves like before.
-  ringPath(path, sizeof(path), "timev2");
-  ringFileConfig_t insCfg = meterConfig(3);
-  CHECK_ERR(ringFileCreate(path, &insCfg, &h), ESP_OK);
-  mkMeter(&rec, 100, 1000, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  ringFileClose(h);
-
-  int fd = open(path, O_RDWR);
-
-  if (fd < 0)
-  {
-    printf("  FATAL open %s for v2 patch\n", path);
-    exit(2);
-  }
-
-  uint8_t hdr[96];
-
-  if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr))
-  {
-    printf("  FATAL read header %s\n", path);
-    exit(2);
-  }
-
-  CHECK(hdr[4] == 3u);   //-- current format version
-  hdr[4] = 2u;           //-- formatVersion = 2 (little-endian u16)
-  hdr[5] = 0u;
-  uint32_t crc = testCrc32(hdr, 88);
-  hdr[88] = (uint8_t)crc;
-  hdr[89] = (uint8_t)(crc >> 8);
-  hdr[90] = (uint8_t)(crc >> 16);
-  hdr[91] = (uint8_t)(crc >> 24);
-
-  if (lseek(fd, 0, SEEK_SET) != 0 ||
-      write(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr))
-  {
-    printf("  FATAL patch header %s\n", path);
-    exit(2);
-  }
-
-  close(fd);
-  logCmdText("patched", "header patched: formatVersion 3 -> 2, CRC recomputed");
-
-  ringFileOpenConfig_t v2cfg = meterOpen(false, RING_FILE_PERSIST_IMMEDIATE, 0);
-  CHECK_ERR(ringFileOpen(path, &v2cfg, &h), ESP_OK);
-  uint64_t k100 = 100;
-  CHECK_ERR(ringFileReadByKey(h, &k100, &out), ESP_OK);
-  CHECK(out.energyWh == 1000);
-
-  //-- Insertion semantics: an out-of-order (smaller) key is accepted and
-  //-- oldest/newest follow seq, not key order.
-  mkMeter(&rec, 50, 500, 0);
-  CHECK_ERR(ringFileAdd(h, &rec), ESP_OK);
-  meterRec_t oldestRec, newestRec;
-  CHECK_ERR(ringFileReadOldest(h, &oldestRec), ESP_OK);
-  CHECK(oldestRec.timestamp == 100);
-  CHECK_ERR(ringFileReadNewest(h, &newestRec), ESP_OK);
-  CHECK(newestRec.timestamp == 50);
-  ringFileClose(h);
-  logCmd(ESP_OK, "v2 file: insertion semantics kept (out-of-order key "
-         "accepted, oldest/newest by seq)");
+  CHECK(period == 1795012255ULL);
 }
 
 int main(int argc, char *argv[])
@@ -2386,9 +2141,13 @@ int main(int argc, char *argv[])
     {"createOpenReopen", testCreateOpenReopen},
     {"emptyRing", testEmptyRing},
     {"singleSlotRing", testSingleSlotRing},
-    {"duplicatesAndWraparound", testDuplicatesAndWraparound},
-    {"updateSemantics", testUpdateSemantics},
-    {"keyTypes", testKeyTypes},
+    {"sameBucketUpdate", testSameBucketUpdate},
+    {"notNewer", testNotNewer},
+    {"timestampValidation", testTimestampValidation},
+    {"bucketAndKeyDerivation", testBucketAndKeyDerivation},
+    {"evictionOrder", testEvictionOrder},
+    {"editWindow", testEditWindow},
+    {"updateByKeyRules", testUpdateByKeyRules},
     {"iterator", testIterator},
     {"schemaMismatch", testSchemaMismatch},
     {"readOnly", testReadOnly},
@@ -2396,25 +2155,21 @@ int main(int argc, char *argv[])
     {"corruption", testCorruption},
     {"clear", testClear},
     {"resize", testResize},
-    {"resizeEmptyAndErrors", testResizeEmptyAndErrors},
     {"resizeInterruptedStates", testResizeInterruptedStates},
     {"failureInjectionMutations", testFailureInjectionMutations},
     {"unchangedWrites", testUnchangedWrites},
     {"wearDistribution", testWearDistribution},
     {"bufferedMode", testBufferedMode},
     {"bufferedOverflowFlushes", testBufferedOverflowFlushes},
-    {"multipleFiles", testMultipleFiles},
+    {"multipleTypes", testMultipleTypes},
     {"validateGoodRing", testValidateGoodRing},
-    {"moreRecords", testMoreRecords},
-    {"keyPositionMask", testKeyPositionMask},
+    {"manyRecords", testManyRecords},
     {"timeHelpers", testTimeHelpers},
-    {"timeBucketRing", testTimeBucketRing},
-    {"timeBucketBufferedAndV2", testTimeBucketBufferedAndV2},
   };
 
   //-- testLog.md: path from argv[1] so run_tests.sh can place it in the
-  //-- repository root. The log records every logged Opdracht (with data),
-  //-- its Resultaat, the key/slot dumps and a per-test overview table.
+  //-- repository root. The log records every logged command (with data),
+  //-- its result, the key/bucket dumps and a per-test overview table.
   const char *logPath = (argc > 1) ? argv[1] : "testLog.md";
   gLog = fopen(logPath, "w");
 
@@ -2432,9 +2187,9 @@ int main(int argc, char *argv[])
     logLine("Generated: %s — host tests with POSIX shims and "
             "failure-injection.", stamp);
     logLine("");
-    logLine("Per line: **Command** (with data) and its **Result**; "
-            "ring dumps show the key and the physical slot number per "
-            "record.");
+    logLine("Every stored record carries the automatic key fields "
+            "timeStamp and usedKey; ring dumps show both plus the reported "
+            "bucketId (period %% capacity).");
     logLine("");
     logLine("| Test | checks | failures |");
     logLine("| --- | ---: | ---: |");

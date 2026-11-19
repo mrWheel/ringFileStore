@@ -1,8 +1,10 @@
 //--
-//-- File Version: [3] 19-11-2026 - 09:06
+//-- File Version: [4] 19-11-2026 - 11:40
 //--
 //-- ringFileStore - main ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
+//--
 //---------------------------------------------------------------------
 //--
 #include <errno.h>
@@ -36,18 +38,25 @@ static const char *TAG = "ring_file_store";
 //-- one slot free for the in-flight commit copy, so no committed record is
 //-- ever overwritten in place. A slot is committed when it carries the
 //-- highest (seq, rev) among the valid copies of its key and fewer than
-//-- capacity members have a higher seq. File growth is lazy: a slot that
-//-- was never written reads back as empty (short read).
+//-- capacity members have a higher period (bucket order). File growth is
+//-- lazy: a slot that was never written reads back as empty (short read).
 //--
-//-- Header (96 bytes):
+//-- Every stored record carries two automatic key fields in front of the
+//-- caller payload:
+//--   [ 0 .. 8 )  u64 timeStamp  (full 14-digit EEYYMMDDhhmmss value)
+//--   [ 8 .. 16 ) u64 usedKey    (timestamp truncated to the file type)
+//--   [ 16 .. )   caller payload bytes
+//-- The key is the usedKey; order/eviction follow the period derived from
+//-- the full timestamp.
+//--
+//-- Header (96 bytes, format version 4):
 //--   0  u32 magic 'RFS1'      4  u16 formatVersion   6  u16 headerSize
-//--   8  u64 generation        16 u32 schemaId        20 u32 schemaVersion
-//--  24  u32 recordSize        28 u32 capacity        32 u32 keyOffset
-//--  36  u32 keyType           40 u32 keySize         44 u32 flags
-//--  48  u64 epoch             56 u64 keyPositionMask
-//--  64  u32 addressingMode    68 u32 granularity    72 u32 timestampOffset
-//--                             (format version 3 only; 76..87 reserved)
-//--  88  u32 crc32 over [0,88) 92 u32 reserved
+//--   8  u64 generation        16 16 bytes schemaId string (NUL-terminated,
+//--                             max 12 chars, rest 0xFF)
+//--  32  u32 recordSize        36 u32 capacity        40 u32 granularity
+//--  44  u32 flags             48 u64 epoch
+//--  56  32 bytes reserved (0xFF)
+//--  88  u32 crc32 over [0,88)
 //--
 //-- Slot header (20 bytes), followed by recordSize raw record bytes:
 //--   0  u32 slotMagic 'RFS2'  4  u64 seq            12 u32 rev
@@ -56,15 +65,19 @@ static const char *TAG = "ring_file_store";
 
 #define RFS_MAGIC 0x52465331u
 #define RFS_SLOT_MAGIC 0x52465332u
-//-- Format version 3 adds the TIMEBUCKET addressing fields (offsets
-//-- 64..72). Version-2 files keep their insertion semantics unchanged.
-#define RFS_FORMAT_VERSION 3u
-#define RFS_FORMAT_VERSION_MIN 2u
+//-- Format version 4 introduces the timestamp key model: automatic key
+//-- fields, the schemaId string header and the period-ordered member set.
+//-- Older format versions (insertion/TIMEBUCKET addressing) are rejected.
+#define RFS_FORMAT_VERSION 4u
+#define RFS_FORMAT_VERSION_MIN 4u
 #define RFS_HEADER_SIZE 96u
 #define RFS_SLOT_HDR_SIZE 20u
+//-- Bytes of the two automatic key fields in front of the payload.
+#define RFS_KEY_FIELDS_SIZE 16u
 
-#define RFS_MAX_RECORD_SIZE 4096u
-#define RFS_MAX_KEY_SIZE 256u
+#define RFS_MAX_PAYLOAD_SIZE 4096u
+#define RFS_MAX_RECORD_SIZE (RFS_KEY_FIELDS_SIZE + RFS_MAX_PAYLOAD_SIZE)
+#define RFS_HEADER_NAME_SIZE 16u
 #define RFS_MAX_CAPACITY 65536u
 #define RFS_MAX_PENDING_LIMIT 64u
 #define RFS_DEFAULT_MAX_PENDING 8u
@@ -274,20 +287,12 @@ struct ringFileHandle_s
   //-- header mirror
   uint64_t generation;
   uint64_t epoch;
-  uint32_t schemaId;
-  uint32_t schemaVersion;
-  uint32_t recordSize;
-  uint32_t capacity;
-  uint32_t keyOffset;
-  uint32_t keyType;
-  uint32_t keySize;
-  uint64_t keyMask;
-  uint32_t slotSize;
-
-  //-- TIMEBUCKET addressing (0 / 0 / 0 in insertion mode).
-  uint32_t addressingMode;   //-- ringFileAddressingMode_t
+  char schemaId[RING_FILE_SCHEMA_MAX_LEN + 1u];
   uint32_t granularity;      //-- ringFileGranularity_t
-  uint32_t timestampOffset;
+  uint32_t payloadSize;      //-- caller struct bytes (key fields excluded)
+  uint32_t recordSize;       //-- stored bytes = payloadSize + 16
+  uint32_t capacity;
+  uint32_t slotSize;
 
   uint64_t nextSeq;
   uint32_t count;
@@ -302,10 +307,13 @@ struct ringFileHandle_s
   uint64_t stagedEpoch;
 
   //-- scratch. keyBufA is internal to rfsBestCopy(); callers that hold a
-  //-- candidate key across a rfsBestCopy() call must pass keyBufB.
+  //-- candidate key across a rfsBestCopy() call must pass keyBufB. Each key
+  //-- buffer holds the 8-byte little-endian usedKey. recBuf is the build
+  //-- buffer for the public write calls ([timeStamp][usedKey][payload]).
   uint8_t *slotBuf;
   uint8_t *keyBufA;
   uint8_t *keyBufB;
+  uint8_t *recBuf;
 };
 
 typedef struct
@@ -323,7 +331,7 @@ typedef struct
   int32_t slot;
   bool pending;
   uint32_t pendingIndex;
-  uint64_t bucket;           //-- TIMEBUCKET mode: the bucketId key value.
+  uint64_t order;            //-- period of the member (bucket order value).
 } rfsMember_t;
 
 #define RFS_ENTER(h)                          \
@@ -398,6 +406,7 @@ static void rfsFreeHandleMembers(ringFileHandle_t *h)
   free(h->slotBuf);
   free(h->keyBufA);
   free(h->keyBufB);
+  free(h->recBuf);
 
   if (h->ownsLock && h->lock != NULL)
   {
@@ -413,10 +422,12 @@ static esp_err_t rfsAllocScratch(ringFileHandle_t *h)
   }
 
   h->slotBuf = (uint8_t *)malloc(h->slotSize);
-  h->keyBufA = (uint8_t *)malloc(h->keySize);
-  h->keyBufB = (uint8_t *)malloc(h->keySize);
+  h->keyBufA = (uint8_t *)malloc(8);
+  h->keyBufB = (uint8_t *)malloc(8);
+  h->recBuf = (uint8_t *)malloc(h->recordSize);
 
-  if (h->slotBuf == NULL || h->keyBufA == NULL || h->keyBufB == NULL)
+  if (h->slotBuf == NULL || h->keyBufA == NULL || h->keyBufB == NULL ||
+      h->recBuf == NULL)
   {
     return ESP_ERR_NO_MEM;
   }
@@ -518,180 +529,68 @@ static int64_t rfsFileLength(int fd)
 }
 
 //-- ---------------------------------------------------------------------------
-//-- Key handling. Integer keys are compared as raw little-endian field
-//-- bytes, which is value equality for fixed-width integers on the supported
-//-- little-endian targets. Extraction uses memcpy so no unaligned load is
-//-- ever issued.
+//-- Key handling. Every stored record carries the automatic key fields
+//-- [u64 timeStamp][u64 usedKey] in front of the payload. The key is the
+//-- usedKey, compared as raw little-endian u64 field bytes (value equality
+//-- on the supported little-endian targets); extraction uses rfsGetU64 so
+//-- no unaligned load is ever issued. Order, eviction and resize retention
+//-- follow the period ("berekende waarde") derived from the full timestamp
+//-- at the file-type granularity.
 //-- ---------------------------------------------------------------------------
 
-static uint16_t rfsKeyTypeWidth(ringFileKeyType_t type)
+static uint64_t rfsTimeStampOfRecord(const uint8_t *record)
 {
-  switch (type)
-  {
-    case RING_FILE_KEY_S8:
-    case RING_FILE_KEY_U8:
-      return 1;
-    case RING_FILE_KEY_S16:
-    case RING_FILE_KEY_U16:
-      return 2;
-    case RING_FILE_KEY_S32:
-    case RING_FILE_KEY_U32:
-      return 4;
-    case RING_FILE_KEY_S64:
-    case RING_FILE_KEY_U64:
-      return 8;
-    default:
-      return 0;
-  }
+  return rfsGetU64(record);
 }
 
-//-- A cleared keyPositionMask means "all positions significant". A set
-//-- mask is limited to the first keySize byte positions, so keySize must
-//-- stay within 64 bits and no bit at or beyond keySize may be set.
-static bool rfsKeyMaskValid(uint64_t mask, uint16_t keySize)
+static uint64_t rfsKeyOfRecord(const uint8_t *record)
 {
-  if (mask == 0)
-  {
-    return true;
-  }
-
-  if (keySize > 64)
-  {
-    return false;
-  }
-
-  uint64_t validBits = (keySize == 64) ? ~0ULL : ((1ULL << keySize) - 1u);
-
-  return (mask & ~validBits) == 0;
+  return rfsGetU64(record + 8u);
 }
 
-static esp_err_t rfsValidateKeyDescriptor(const ringFileKeyDescriptor_t *key,
-                                          uint32_t recordSize)
+static bool rfsKeyEqual(const uint8_t *a, const uint8_t *b)
 {
-  if (key->keyType < RING_FILE_KEY_S8 || key->keyType > RING_FILE_KEY_STRING)
-  {
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  uint16_t width = rfsKeyTypeWidth((ringFileKeyType_t)key->keyType);
-
-  if (width != 0)
-  {
-    if (key->keySize != width)
-    {
-      return ESP_ERR_INVALID_ARG;
-    }
-  }
-  else if (key->keySize == 0 || key->keySize > RFS_MAX_KEY_SIZE)
-  {
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  uint64_t end = (uint64_t)key->keyOffset + key->keySize;
-
-  if (end > recordSize)
-  {
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  if (!rfsKeyMaskValid(key->keyPositionMask, key->keySize))
-  {
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  return ESP_OK;
-}
-
-static bool rfsKeyBytesValid(const ringFileHandle_t *h, const uint8_t *key)
-{
-  if ((ringFileKeyType_t)h->keyType == RING_FILE_KEY_STRING)
-  {
-    return memchr(key, 0, h->keySize) != NULL;
-  }
-
-  return true;
-}
-
-static bool rfsKeyEqual(const ringFileHandle_t *h, const uint8_t *a, const uint8_t *b)
-{
-  bool isString = ((ringFileKeyType_t)h->keyType == RING_FILE_KEY_STRING);
-
-  if (h->keyMask == 0)
-  {
-    if (isString)
-    {
-      //-- Bytes after the first terminator are ignored.
-      return strncmp((const char *)a, (const char *)b, h->keySize) == 0;
-    }
-
-    return memcmp(a, b, h->keySize) == 0;
-  }
-
-  //-- Masked comparison: insignificant positions are ignored. For strings
-  //-- the comparison ends at the first terminator of either key, matching
-  //-- the unmasked strncmp behaviour.
-  for (uint32_t i = 0; i < h->keySize; i++)
-  {
-    if (isString && (a[i] == 0 || b[i] == 0))
-    {
-      return a[i] == b[i];
-    }
-
-    if (((h->keyMask >> i) & 1u) != 0 && a[i] != b[i])
-    {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-static bool rfsIsTimeBucket(const ringFileHandle_t *h)
-{
-  return (ringFileAddressingMode_t)h->addressingMode ==
-         RING_FILE_ADDRESSING_TIMEBUCKET;
+  return memcmp(a, b, 8) == 0;
 }
 
 static void rfsExtractKey(const ringFileHandle_t *h, const uint8_t *record,
                           uint8_t *keyOut)
 {
-  if (rfsIsTimeBucket(h))
-  {
-    //-- The key is the component-derived bucketId of the timeStamp field
-    //-- (little-endian u64). The granularity was validated at create/open,
-    //-- so the conversion always succeeds.
-    uint64_t timeStamp = 0;
-    memcpy(&timeStamp, record + h->timestampOffset, sizeof(timeStamp));
-
-    uint64_t bucket = 0;
-    (void)rfsTimeUnixToBucketId(timeStamp,
-                                (ringFileGranularity_t)h->granularity, &bucket);
-    rfsPutU64(keyOut, bucket);
-    return;
-  }
-
-  memcpy(keyOut, record + h->keyOffset, h->keySize);
+  (void)h;
+  rfsPutU64(keyOut, rfsKeyOfRecord(record));
 }
 
-//-- Order value behind "oldest .. newest". Insertion mode ranks members by
-//-- seq; TIMEBUCKET mode ranks them by bucketId (monotonic with time).
-static uint64_t rfsOrderOf(const ringFileHandle_t *h, uint64_t seq,
-                           uint64_t bucket)
+//-- Period of a stored record (from the full timestamp). The digits were
+//-- validated on write and the CRC covers the bytes, so the conversion
+//-- always succeeds for a valid slot.
+static uint64_t rfsOrderOfRecord(const ringFileHandle_t *h,
+                                 const uint8_t *record)
 {
-  return rfsIsTimeBucket(h) ? bucket : seq;
+  uint64_t period = 0;
+  (void)rfsTimeDigitsToPeriod(rfsTimeStampOfRecord(record),
+                              (ringFileGranularity_t)h->granularity, &period);
+  return period;
 }
 
-//-- Bucket key value of a staged (pending) record.
-static uint64_t rfsBucketOfPending(ringFileHandle_t *h, uint32_t p)
+//-- Period behind a key (usedKey) byte buffer: zero-pads the usedKey back
+//-- to 14 digits, then applies the period formula.
+static uint64_t rfsOrderOfKey(const ringFileHandle_t *h, const uint8_t *key)
 {
-  rfsExtractKey(h, h->pendingRecords + (size_t)p * h->recordSize, h->keyBufB);
-  return rfsGetU64(h->keyBufB);
+  uint64_t period = 0;
+  (void)rfsTimeUsedKeyToPeriod(rfsGetU64(key),
+                               (ringFileGranularity_t)h->granularity, &period);
+  return period;
 }
 
-//-- Slot index reported by ringFileIteratorGetSlot(): the physical slot
-//-- in insertion mode, the DSMRlogger-style logical slot bucketId %
-//-- capacity in TIMEBUCKET mode, and the staged marker for a record that
-//-- has not reached storage yet.
+//-- Period of a staged (pending) record.
+static uint64_t rfsOrderOfPending(const ringFileHandle_t *h, uint32_t p)
+{
+  return rfsOrderOfRecord(h, h->pendingRecords + (size_t)p * h->recordSize);
+}
+
+//-- Slot index reported by ringFileIteratorGetSlot(): the DSMRlogger-style
+//-- logical slot bucketId = period % capacity, and the staged marker for a
+//-- record that has not reached storage yet.
 static uint32_t rfsSlotReportOf(const ringFileHandle_t *h, const rfsMember_t *m)
 {
   if (m->pending)
@@ -699,12 +598,38 @@ static uint32_t rfsSlotReportOf(const ringFileHandle_t *h, const rfsMember_t *m)
     return RING_FILE_SLOT_STAGED;
   }
 
-  if (rfsIsTimeBucket(h))
+  return (uint32_t)(m->order % h->capacity);
+}
+
+//-- Build one stored record image [timeStamp][usedKey][payload] from a
+//-- validated timestamp and a caller payload buffer. The caller holds the
+//-- handle lock. outOrder receives the period of the record.
+static esp_err_t rfsBuildRecordLocked(ringFileHandle_t *h, uint64_t timeStamp,
+                                      const void *payload, uint8_t *outBuf,
+                                      uint64_t *outOrder)
+{
+  uint64_t usedKey = 0;
+
+  if (!rfsTimeDigitsToUsedKey(timeStamp, (ringFileGranularity_t)h->granularity,
+                              &usedKey))
   {
-    return (uint32_t)(m->bucket % h->capacity);
+    return ESP_ERR_INVALID_ARG;
   }
 
-  return (uint32_t)m->slot;
+  rfsPutU64(outBuf, timeStamp);
+  rfsPutU64(outBuf + 8u, usedKey);
+  memcpy(outBuf + RFS_KEY_FIELDS_SIZE, payload, h->payloadSize);
+
+  uint64_t period = 0;
+  (void)rfsTimeDigitsToPeriod(timeStamp, (ringFileGranularity_t)h->granularity,
+                              &period);
+
+  if (outOrder != NULL)
+  {
+    *outOrder = period;
+  }
+
+  return ESP_OK;
 }
 
 //-- ---------------------------------------------------------------------------
@@ -807,7 +732,9 @@ static bool rfsMemberBetter(uint64_t seqA, uint32_t revA, uint64_t seqB, uint32_
   return (seqA > seqB) || (seqA == seqB && revA > revB);
 }
 
-//-- Newest valid copy of a key across disk slots and staged entries.
+//-- Newest valid copy of a key across disk slots and staged entries. The
+//-- key is the 8-byte little-endian usedKey; out->order carries the period
+//-- behind that key.
 static void rfsBestCopy(ringFileHandle_t *h, const uint8_t *key, rfsMember_t *out)
 {
   out->found = false;
@@ -816,9 +743,7 @@ static void rfsBestCopy(ringFileHandle_t *h, const uint8_t *key, rfsMember_t *ou
   out->slot = -1;
   out->pending = false;
   out->pendingIndex = 0;
-
-  //-- In TIMEBUCKET mode the key bytes are the bucketId itself.
-  out->bucket = rfsIsTimeBucket(h) ? rfsGetU64(key) : 0;
+  out->order = rfsOrderOfKey(h, key);
 
   uint32_t slots = rfsSlotCount(h);
 
@@ -833,7 +758,7 @@ static void rfsBestCopy(ringFileHandle_t *h, const uint8_t *key, rfsMember_t *ou
 
     rfsExtractKey(h, h->slotBuf, h->keyBufA);
 
-    if (!rfsKeyEqual(h, h->keyBufA, key))
+    if (!rfsKeyEqual(h->keyBufA, key))
     {
       continue;
     }
@@ -858,7 +783,7 @@ static void rfsBestCopy(ringFileHandle_t *h, const uint8_t *key, rfsMember_t *ou
     const uint8_t *record = h->pendingRecords + (size_t)p * h->recordSize;
     rfsExtractKey(h, record, h->keyBufA);
 
-    if (!rfsKeyEqual(h, h->keyBufA, key))
+    if (!rfsKeyEqual(h->keyBufA, key))
     {
       continue;
     }
@@ -876,13 +801,11 @@ static void rfsBestCopy(ringFileHandle_t *h, const uint8_t *key, rfsMember_t *ou
   }
 }
 
-//-- Number of members (distinct keys, newest copies) whose order value is
-//-- greater than the given one: seq in insertion mode, bucketId in
-//-- TIMEBUCKET mode. A member is committed when this rank is < capacity.
-static uint32_t rfsRankGreater(ringFileHandle_t *h, uint64_t seq, uint64_t bucket)
+//-- Number of members (distinct keys, newest copies) whose period is
+//-- greater than the given one. A member is committed when this rank is
+//-- < capacity.
+static uint32_t rfsRankGreater(ringFileHandle_t *h, uint64_t order)
 {
-  bool timeMode = rfsIsTimeBucket(h);
-  uint64_t order = rfsOrderOf(h, seq, bucket);
   uint32_t rank = 0;
   uint32_t slots = rfsSlotCount(h);
 
@@ -896,9 +819,9 @@ static uint32_t rfsRankGreater(ringFileHandle_t *h, uint64_t seq, uint64_t bucke
     }
 
     rfsExtractKey(h, h->slotBuf, h->keyBufB);
-    uint64_t slotBucket = timeMode ? rfsGetU64(h->keyBufB) : 0;
+    uint64_t slotOrder = rfsOrderOfRecord(h, h->slotBuf);
 
-    if (timeMode ? (slotBucket <= order) : (hdr.seq <= seq))
+    if (slotOrder <= order)
     {
       continue;
     }
@@ -919,14 +842,14 @@ static uint32_t rfsRankGreater(ringFileHandle_t *h, uint64_t seq, uint64_t bucke
       continue;
     }
 
-    const uint8_t *record = h->pendingRecords + (size_t)p * h->recordSize;
-    rfsExtractKey(h, record, h->keyBufB);
-    uint64_t pendingBucket = timeMode ? rfsGetU64(h->keyBufB) : 0;
+    uint64_t pOrder = rfsOrderOfPending(h, p);
 
-    if (timeMode ? (pendingBucket <= order) : (h->pending[p].seq <= seq))
+    if (pOrder <= order)
     {
       continue;
     }
+
+    rfsExtractKey(h, h->pendingRecords + (size_t)p * h->recordSize, h->keyBufB);
 
     rfsMember_t best;
     rfsBestCopy(h, h->keyBufB, &best);
@@ -947,7 +870,7 @@ static bool rfsMemberIsCommitted(ringFileHandle_t *h, const rfsMember_t *m)
     return false;
   }
 
-  return rfsRankGreater(h, m->seq, m->bucket) < h->capacity;
+  return rfsRankGreater(h, m->order) < h->capacity;
 }
 
 static bool rfsFindActive(ringFileHandle_t *h, const uint8_t *key, rfsMember_t *out)
@@ -1008,6 +931,7 @@ static uint32_t rfsCountActive(ringFileHandle_t *h)
     }
   }
 
+
   for (uint32_t p = 0; p < h->pendingCount; p++)
   {
     if (h->pending[p].used)
@@ -1038,13 +962,13 @@ static esp_err_t rfsSelectFreeSlot(ringFileHandle_t *h, uint32_t *outIdx)
     }
 
     rfsExtractKey(h, h->slotBuf, h->keyBufB);
-    uint64_t slotBucket = rfsIsTimeBucket(h) ? rfsGetU64(h->keyBufB) : 0;
+    uint64_t slotOrder = rfsOrderOfRecord(h, h->slotBuf);
 
     rfsMember_t best;
     rfsBestCopy(h, h->keyBufB, &best);
 
     bool isMember = best.found && !best.pending && (uint32_t)best.slot == idx &&
-                    rfsRankGreater(h, hdr.seq, slotBucket) < h->capacity;
+                    rfsRankGreater(h, slotOrder) < h->capacity;
 
     if (!isMember)
     {
@@ -1072,7 +996,7 @@ static int32_t rfsFindPending(ringFileHandle_t *h, const uint8_t *key)
 
     rfsExtractKey(h, h->pendingRecords + (size_t)p * h->recordSize, h->keyBufA);
 
-    if (rfsKeyEqual(h, h->keyBufA, key))
+    if (rfsKeyEqual(h->keyBufA, key))
     {
       return (int32_t)p;
     }
@@ -1255,22 +1179,16 @@ static void rfsEncodeHeader(const ringFileHandle_t *h, uint8_t *buf,
   rfsPutU16(buf + 4, RFS_FORMAT_VERSION);
   rfsPutU16(buf + 6, RFS_HEADER_SIZE);
   rfsPutU64(buf + 8, generation);
-  rfsPutU32(buf + 16, h->schemaId);
-  rfsPutU32(buf + 20, h->schemaVersion);
-  rfsPutU32(buf + 24, h->recordSize);
-  rfsPutU32(buf + 28, capacity);
-  rfsPutU32(buf + 32, h->keyOffset);
-  rfsPutU32(buf + 36, h->keyType);
-  rfsPutU32(buf + 40, h->keySize);
+
+  //-- schemaId string at [16,32): NUL-terminated, at most 12 characters;
+  //-- bytes after the terminator stay 0xFF. Validated at create time.
+  memcpy(buf + 16, h->schemaId, strlen(h->schemaId) + 1u);
+
+  rfsPutU32(buf + 32, h->recordSize);
+  rfsPutU32(buf + 36, capacity);
+  rfsPutU32(buf + 40, h->granularity);
   rfsPutU32(buf + 44, 0);
   rfsPutU64(buf + 48, epoch);
-  rfsPutU64(buf + 56, h->keyMask);
-
-  //-- Format version 3 addressing fields (inside the CRC range). Zero in
-  //-- insertion mode.
-  rfsPutU32(buf + 64, h->addressingMode);
-  rfsPutU32(buf + 68, h->granularity);
-  rfsPutU32(buf + 72, h->timestampOffset);
 
   rfsPutU32(buf + 88, rfsCrc32(buf, 88));
 }
@@ -1314,30 +1232,78 @@ static esp_err_t rfsDecodeHeader(const uint8_t *buf, int64_t fileLength,
     return RING_FILE_STORE_ERR_CORRUPT;
   }
 
-  uint32_t recordSize = rfsGetU32(buf + 24);
-  uint32_t capacity = rfsGetU32(buf + 28);
-  uint32_t keyOffset = rfsGetU32(buf + 32);
-  uint32_t keyType = rfsGetU32(buf + 36);
-  uint32_t keySize = rfsGetU32(buf + 40);
-  uint64_t keyMask = rfsGetU64(buf + 56);
+  uint32_t recordSize = rfsGetU32(buf + 32);
+  uint32_t capacity = rfsGetU32(buf + 36);
+  uint32_t granularity = rfsGetU32(buf + 40);
+  uint32_t flags = rfsGetU32(buf + 44);
 
-  if (recordSize == 0 || recordSize > RFS_MAX_RECORD_SIZE || capacity == 0 ||
-      capacity > RFS_MAX_CAPACITY)
+  if (recordSize <= RFS_KEY_FIELDS_SIZE || recordSize > RFS_MAX_RECORD_SIZE ||
+      capacity == 0 || capacity > RFS_MAX_CAPACITY ||
+      granularity < RING_FILE_GRANULARITY_YEAR ||
+      granularity > RING_FILE_GRANULARITY_SECOND || flags != 0u)
   {
     *issue = RING_FILE_META_BAD_GEOMETRY;
     return RING_FILE_STORE_ERR_FORMAT;
   }
 
-  uint32_t keyTypeWidth = rfsKeyTypeWidth((ringFileKeyType_t)keyType);
-
-  if (keyType < RING_FILE_KEY_S8 || keyType > RING_FILE_KEY_STRING ||
-      (keyTypeWidth != 0 && keySize != keyTypeWidth) ||
-      (keyTypeWidth == 0 && (keySize == 0 || keySize > RFS_MAX_KEY_SIZE)) ||
-      (uint64_t)keyOffset + keySize > recordSize ||
-      !rfsKeyMaskValid(keyMask, (uint16_t)keySize))
+  //-- schemaId string at [16,32): a NUL-terminated string of at most 12
+  //-- characters; bytes after the terminator must be 0xFF. The string must
+  //-- be one of the known file types and match the stored granularity.
+  if (buf[16 + RFS_HEADER_NAME_SIZE - 1u] != 0xFFu)
   {
     *issue = RING_FILE_META_BAD_GEOMETRY;
     return RING_FILE_STORE_ERR_FORMAT;
+  }
+
+  uint32_t nameEnd = 0;
+  bool terminated = false;
+
+  //-- The terminator sits at position 0..12 of the 16-byte field.
+  for (uint32_t i = 0; i <= RING_FILE_SCHEMA_MAX_LEN; i++)
+  {
+    if (buf[16u + i] == 0u)
+    {
+      nameEnd = i;
+      terminated = true;
+      break;
+    }
+  }
+
+  if (!terminated)
+  {
+    *issue = RING_FILE_META_BAD_GEOMETRY;
+    return RING_FILE_STORE_ERR_FORMAT;
+  }
+
+  char schemaId[RING_FILE_SCHEMA_MAX_LEN + 1u];
+  memcpy(schemaId, buf + 16, nameEnd);
+  schemaId[nameEnd] = '\0';
+
+  for (uint32_t i = nameEnd + 1u; i < RFS_HEADER_NAME_SIZE; i++)
+  {
+    if (buf[16u + i] != 0xFFu)
+    {
+      *issue = RING_FILE_META_BAD_GEOMETRY;
+      return RING_FILE_STORE_ERR_FORMAT;
+    }
+  }
+
+  ringFileGranularity_t mapped = RING_FILE_GRANULARITY_NONE;
+
+  if (!rfsTimeSchemaIdToGranularity(schemaId, &mapped) ||
+      (uint32_t)mapped != granularity)
+  {
+    *issue = RING_FILE_META_BAD_GEOMETRY;
+    return RING_FILE_STORE_ERR_FORMAT;
+  }
+
+  for (uint32_t i = 56; i < 88; i++)
+  {
+    if (buf[i] != 0xFFu)
+    {
+      *issue = RING_FILE_META_BAD_GEOMETRY;
+      return RING_FILE_STORE_ERR_FORMAT;
+    }
   }
 
   uint32_t slotSize = RFS_SLOT_HDR_SIZE + recordSize;
@@ -1350,70 +1316,14 @@ static esp_err_t rfsDecodeHeader(const uint8_t *buf, int64_t fileLength,
     return RING_FILE_STORE_ERR_CORRUPT;
   }
 
-  //-- Addressing fields exist from format version 3 on. A version-2 file
-  //-- has 0xFF reserved bytes there and keeps insertion semantics.
-  uint32_t addressingMode = RING_FILE_ADDRESSING_INSERTION;
-  uint32_t granularity = RING_FILE_GRANULARITY_NONE;
-  uint32_t timestampOffset = 0;
-
-  if (formatVersion >= 3u)
-  {
-    addressingMode = rfsGetU32(buf + 64);
-    granularity = rfsGetU32(buf + 68);
-    timestampOffset = rfsGetU32(buf + 72);
-
-    for (uint32_t i = 76; i < 88; i++)
-    {
-      if (buf[i] != 0xFFu)
-      {
-        *issue = RING_FILE_META_BAD_GEOMETRY;
-        return RING_FILE_STORE_ERR_FORMAT;
-      }
-    }
-
-    bool timeMode = (addressingMode == RING_FILE_ADDRESSING_TIMEBUCKET);
-
-    if (addressingMode > RING_FILE_ADDRESSING_TIMEBUCKET)
-    {
-      *issue = RING_FILE_META_BAD_GEOMETRY;
-      return RING_FILE_STORE_ERR_FORMAT;
-    }
-
-    if (timeMode)
-    {
-      //-- The component always stores the bucket key as U64/8 bytes at the
-      //-- timestamp offset; anything else is a damaged or foreign header.
-      if (granularity < RING_FILE_GRANULARITY_HOUR ||
-          granularity > RING_FILE_GRANULARITY_MONTH ||
-          (uint64_t)timestampOffset + 8u > recordSize ||
-          keyType != (uint32_t)RING_FILE_KEY_U64 || keySize != 8u ||
-          keyOffset != timestampOffset || keyMask != 0)
-      {
-        *issue = RING_FILE_META_BAD_GEOMETRY;
-        return RING_FILE_STORE_ERR_FORMAT;
-      }
-    }
-    else if (granularity != RING_FILE_GRANULARITY_NONE || timestampOffset != 0)
-    {
-      *issue = RING_FILE_META_BAD_GEOMETRY;
-      return RING_FILE_STORE_ERR_FORMAT;
-    }
-  }
-
+  memcpy(probe->schemaId, schemaId, nameEnd + 1u);
+  probe->granularity = granularity;
+  probe->payloadSize = recordSize - RFS_KEY_FIELDS_SIZE;
   probe->recordSize = recordSize;
   probe->capacity = capacity;
-  probe->keyOffset = keyOffset;
-  probe->keyType = keyType;
-  probe->keySize = keySize;
-  probe->keyMask = keyMask;
   probe->slotSize = slotSize;
   probe->generation = rfsGetU64(buf + 8);
   probe->epoch = rfsGetU64(buf + 48);
-  probe->schemaId = rfsGetU32(buf + 16);
-  probe->schemaVersion = rfsGetU32(buf + 20);
-  probe->addressingMode = addressingMode;
-  probe->granularity = granularity;
-  probe->timestampOffset = timestampOffset;
   *headerOk = true;
   return ESP_OK;
 }
@@ -1590,18 +1500,12 @@ static esp_err_t rfsOpenDataFile(ringFileHandle_t *h)
     h->fd = fd;
     h->generation = probe.generation;
     h->epoch = probe.epoch;
-    h->schemaId = probe.schemaId;
-    h->schemaVersion = probe.schemaVersion;
+    memcpy(h->schemaId, probe.schemaId, sizeof(h->schemaId));
+    h->granularity = probe.granularity;
+    h->payloadSize = probe.payloadSize;
     h->recordSize = probe.recordSize;
     h->capacity = probe.capacity;
-    h->keyOffset = probe.keyOffset;
-    h->keyType = probe.keyType;
-    h->keySize = probe.keySize;
-    h->keyMask = probe.keyMask;
     h->slotSize = probe.slotSize;
-    h->addressingMode = probe.addressingMode;
-    h->granularity = probe.granularity;
-    h->timestampOffset = probe.timestampOffset;
 
     return ESP_OK;
   }
@@ -1679,6 +1583,7 @@ static esp_err_t rfsDeriveState(ringFileHandle_t *h)
 //-- ---------------------------------------------------------------------------
 
 static esp_err_t rfsValidateConfig(const ringFileConfig_t *config,
+                                   uint32_t *outGranularity,
                                    uint32_t *outMaxPending)
 {
   if (config->maxRecords == 0 || config->maxRecords > RFS_MAX_CAPACITY)
@@ -1686,34 +1591,16 @@ static esp_err_t rfsValidateConfig(const ringFileConfig_t *config,
     return ESP_ERR_INVALID_ARG;
   }
 
-  if (config->recordSize == 0 || config->recordSize > RFS_MAX_RECORD_SIZE)
+  ringFileGranularity_t granularity = RING_FILE_GRANULARITY_NONE;
+
+  if (!rfsTimeSchemaIdToGranularity(config->schemaId, &granularity))
   {
     return ESP_ERR_INVALID_ARG;
   }
 
-  if (config->addressing == RING_FILE_ADDRESSING_TIMEBUCKET)
-  {
-    //-- The key is component-derived; config->key is ignored. The
-    //-- timestamp field must fit inside the record.
-    if (config->granularity < RING_FILE_GRANULARITY_HOUR ||
-        config->granularity > RING_FILE_GRANULARITY_MONTH ||
-        (uint64_t)config->timestampOffset + 8u > config->recordSize)
-    {
-      return ESP_ERR_INVALID_ARG;
-    }
-  }
-  else if (config->addressing != RING_FILE_ADDRESSING_INSERTION)
+  if (config->recordSize == 0 || config->recordSize > RFS_MAX_PAYLOAD_SIZE)
   {
     return ESP_ERR_INVALID_ARG;
-  }
-  else
-  {
-    esp_err_t err = rfsValidateKeyDescriptor(&config->key, config->recordSize);
-
-    if (err != ESP_OK)
-    {
-      return err;
-    }
   }
 
   if (config->persistMode != RING_FILE_PERSIST_IMMEDIATE &&
@@ -1739,8 +1626,10 @@ static esp_err_t rfsValidateConfig(const ringFileConfig_t *config,
   }
 
   *outMaxPending = maxPending;
+  *outGranularity = (uint32_t)granularity;
 
-  uint64_t slotSize = RFS_SLOT_HDR_SIZE + config->recordSize;
+  uint64_t slotSize =
+      RFS_SLOT_HDR_SIZE + RFS_KEY_FIELDS_SIZE + (uint64_t)config->recordSize;
   uint64_t storage =
       (uint64_t)RFS_HEADER_SIZE + (uint64_t)(config->maxRecords + 1u) * slotSize;
 
@@ -1785,6 +1674,28 @@ static esp_err_t rfsValidateOpenConfig(const ringFileOpenConfig_t *openConfig,
 //-- Public API
 //-- ---------------------------------------------------------------------------
 
+//-- ---------------------------------------------------------------------------
+//-- Boot notice
+//--
+//-- projectPrompt item 6: after the first successful create or open per boot,
+//-- log the copyright/warranty notice with one ESP_LOGI() per line, using the
+//-- tag ringFileStore.
+//-- ---------------------------------------------------------------------------
+
+static void rfsLogBootNotice(void)
+{
+  static bool sBootNoticeLogged = false;
+
+  if (!sBootNoticeLogged)
+  {
+    sBootNoticeLogged = true;
+    ESP_LOGI("ringFileStore", "ringFileStore  Copyright (C) 2026 Willem Aandewiel");
+    ESP_LOGI("ringFileStore", "This program comes with ABSOLUTELY NO WARRANTY.");
+    ESP_LOGI("ringFileStore", "This is free software, and you are welcome to redistribute it");
+    ESP_LOGI("ringFileStore", "under the terms described in the LICENSE file.");
+  }
+}
+
 esp_err_t ringFileCreate(const char *path, const ringFileConfig_t *config,
                          ringFileHandle_t **outHandle)
 {
@@ -1794,7 +1705,8 @@ esp_err_t ringFileCreate(const char *path, const ringFileConfig_t *config,
   }
 
   uint32_t maxPending = 0;
-  esp_err_t err = rfsValidateConfig(config, &maxPending);
+  uint32_t granularity = 0;
+  esp_err_t err = rfsValidateConfig(config, &granularity, &maxPending);
 
   if (err != ESP_OK)
   {
@@ -1816,34 +1728,13 @@ esp_err_t ringFileCreate(const char *path, const ringFileConfig_t *config,
     return err;
   }
 
-  h->schemaId = config->schemaId;
-  h->schemaVersion = config->schemaVersion;
-  h->recordSize = config->recordSize;
+  strncpy(h->schemaId, config->schemaId, RING_FILE_SCHEMA_MAX_LEN);
+  h->schemaId[RING_FILE_SCHEMA_MAX_LEN] = '\0';
+  h->granularity = granularity;
+  h->payloadSize = config->recordSize;
+  h->recordSize = RFS_KEY_FIELDS_SIZE + config->recordSize;
   h->capacity = config->maxRecords;
-  if (config->addressing == RING_FILE_ADDRESSING_TIMEBUCKET)
-  {
-    //-- The key is the component-derived bucketId: fixed U64/8 bytes at
-    //-- the timestamp offset, no mask.
-    h->addressingMode = RING_FILE_ADDRESSING_TIMEBUCKET;
-    h->granularity = (uint32_t)config->granularity;
-    h->timestampOffset = config->timestampOffset;
-    h->keyOffset = config->timestampOffset;
-    h->keyType = (uint32_t)RING_FILE_KEY_U64;
-    h->keySize = 8;
-    h->keyMask = 0;
-  }
-  else
-  {
-    h->addressingMode = RING_FILE_ADDRESSING_INSERTION;
-    h->granularity = RING_FILE_GRANULARITY_NONE;
-    h->timestampOffset = 0;
-    h->keyOffset = config->key.keyOffset;
-    h->keyType = (uint32_t)config->key.keyType;
-    h->keySize = config->key.keySize;
-    h->keyMask = config->key.keyPositionMask;
-  }
-
-  h->slotSize = RFS_SLOT_HDR_SIZE + config->recordSize;
+  h->slotSize = RFS_SLOT_HDR_SIZE + h->recordSize;
   h->epoch = 0;
   h->generation = 0;
   h->ownsLock = true;
@@ -1866,7 +1757,7 @@ esp_err_t ringFileCreate(const char *path, const ringFileConfig_t *config,
   }
 
   h->pending = (rfsPendingEntry_t *)calloc(maxPending, sizeof(rfsPendingEntry_t));
-  h->pendingRecords = (uint8_t *)malloc((size_t)maxPending * config->recordSize);
+  h->pendingRecords = (uint8_t *)malloc((size_t)maxPending * h->recordSize);
 
   if (h->pending == NULL || h->pendingRecords == NULL)
   {
@@ -1922,6 +1813,7 @@ esp_err_t ringFileCreate(const char *path, const ringFileConfig_t *config,
 
   h->nextSeq = 0;
   h->count = 0;
+  rfsLogBootNotice();
   *outHandle = h;
   return ESP_OK;
 }
@@ -1981,12 +1873,9 @@ esp_err_t ringFileOpen(const char *path, const ringFileOpenConfig_t *openConfig,
     return err;
   }
 
-  if (h->schemaId != openConfig->expectedSchemaId ||
-      h->schemaVersion != openConfig->expectedSchemaVersion ||
-      h->recordSize != openConfig->expectedRecordSize ||
-      h->addressingMode != (uint32_t)openConfig->expectedAddressing ||
-      h->granularity != (uint32_t)openConfig->expectedGranularity ||
-      h->timestampOffset != openConfig->expectedTimestampOffset)
+  if (openConfig->expectedSchemaId == NULL ||
+      strcmp(h->schemaId, openConfig->expectedSchemaId) != 0 ||
+      h->payloadSize != openConfig->expectedRecordSize)
   {
     rfsIoClose(h->fd);
     h->fd = -1;
@@ -2048,6 +1937,7 @@ esp_err_t ringFileOpen(const char *path, const ringFileOpenConfig_t *openConfig,
     return ESP_ERR_NO_MEM;
   }
 
+  rfsLogBootNotice();
   *outHandle = h;
   return ESP_OK;
 }
@@ -2112,15 +2002,15 @@ static esp_err_t rfsCheckWritable(ringFileHandle_t *h)
 }
 
 //-- ---------------------------------------------------------------------------
-//-- TIMEBUCKET write helpers (ringFileAdd / ringFileUpsert / ringFileEdit)
+//-- Timestamp write helpers (ringFileAdd / ringFileUpsert / ringFileEdit)
 //-- ---------------------------------------------------------------------------
 
-//-- Newest stored bucketId among committed members (disk and staged).
+//-- Newest stored period among committed members (disk and staged).
 //-- Returns false when the ring holds no committed member.
-static bool rfsMaxBucketLocked(ringFileHandle_t *h, uint64_t *outBucket)
+static bool rfsMaxOrderLocked(ringFileHandle_t *h, uint64_t *outOrder)
 {
   bool found = false;
-  *outBucket = 0;
+  *outOrder = 0;
   uint32_t slots = rfsSlotCount(h);
 
   for (uint32_t idx = 0; idx < slots; idx++)
@@ -2132,8 +2022,10 @@ static bool rfsMaxBucketLocked(ringFileHandle_t *h, uint64_t *outBucket)
       continue;
     }
 
+    //-- Derive key and period from the slot image before rfsBestCopy()
+    //-- reuses the scratch buffers.
     rfsExtractKey(h, h->slotBuf, h->keyBufB);
-    uint64_t bucket = rfsGetU64(h->keyBufB);
+    uint64_t order = rfsOrderOfRecord(h, h->slotBuf);
 
     rfsMember_t cand;
     rfsBestCopy(h, h->keyBufB, &cand);
@@ -2143,15 +2035,15 @@ static bool rfsMaxBucketLocked(ringFileHandle_t *h, uint64_t *outBucket)
       continue;
     }
 
-    if (rfsRankGreater(h, hdr.seq, bucket) >= h->capacity)
+    if (rfsRankGreater(h, order) >= h->capacity)
     {
       continue;
     }
 
-    if (!found || bucket > *outBucket)
+    if (!found || order > *outOrder)
     {
       found = true;
-      *outBucket = bucket;
+      *outOrder = order;
     }
   }
 
@@ -2162,29 +2054,29 @@ static bool rfsMaxBucketLocked(ringFileHandle_t *h, uint64_t *outBucket)
       continue;
     }
 
-    uint64_t bucket = rfsBucketOfPending(h, p);
+    uint64_t order = rfsOrderOfPending(h, p);
 
-    if (rfsRankGreater(h, h->pending[p].seq, bucket) >= h->capacity)
+    if (rfsRankGreater(h, order) >= h->capacity)
     {
       continue;
     }
 
-    if (!found || bucket > *outBucket)
+    if (!found || order > *outOrder)
     {
       found = true;
-      *outBucket = bucket;
+      *outOrder = order;
     }
   }
 
   return found;
 }
 
-//-- Shared add path of ringFileAdd and ringFileUpsert in TIMEBUCKET mode:
-//-- overwrite the active record of the same bucket (many timestamps map to
-//-- one bucket), otherwise append only when the bucket is newer than the
-//-- newest stored bucket.
+//-- Shared append path of ringFileAdd and ringFileUpsert: overwrite the
+//-- active record of the same bucket (many timestamps map to one bucket),
+//-- otherwise append only when the period is newer than the newest stored
+//-- period. key is the 8-byte usedKey, order its period.
 static esp_err_t rfsTimeAddLocked(ringFileHandle_t *handle, const uint8_t *key,
-                                  const uint8_t *record)
+                                  uint64_t order, const uint8_t *record)
 {
   rfsMember_t member;
 
@@ -2193,10 +2085,9 @@ static esp_err_t rfsTimeAddLocked(ringFileHandle_t *handle, const uint8_t *key,
     return rfsUpdateLocked(handle, key, record);
   }
 
-  uint64_t bucket = rfsGetU64(key);
-  uint64_t newestBucket = 0;
+  uint64_t newestOrder = 0;
 
-  if (rfsMaxBucketLocked(handle, &newestBucket) && bucket <= newestBucket)
+  if (rfsMaxOrderLocked(handle, &newestOrder) && order <= newestOrder)
   {
     //-- Time always moves forward: reject a clock rewind or a gap fill.
     return RING_FILE_STORE_ERR_NOT_NEWER;
@@ -2220,7 +2111,8 @@ static esp_err_t rfsTimeAddLocked(ringFileHandle_t *handle, const uint8_t *key,
   return err;
 }
 
-esp_err_t ringFileAdd(ringFileHandle_t *handle, const void *record)
+esp_err_t ringFileAdd(ringFileHandle_t *handle, uint64_t timeStamp,
+                      const void *record)
 {
   if (handle == NULL || record == NULL)
   {
@@ -2236,68 +2128,36 @@ esp_err_t ringFileAdd(ringFileHandle_t *handle, const void *record)
     return err;
   }
 
-  uint8_t key[RFS_MAX_KEY_SIZE];
-  rfsExtractKey(handle, (const uint8_t *)record, key);
-
-  if (!rfsKeyBytesValid(handle, key))
-  {
-    RFS_EXIT(handle);
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  if (rfsIsTimeBucket(handle))
-  {
-    err = rfsTimeAddLocked(handle, key, (const uint8_t *)record);
-    RFS_EXIT(handle);
-    return err;
-  }
-
-  rfsMember_t active;
-
-  if (rfsFindActive(handle, key, &active))
-  {
-    RFS_EXIT(handle);
-    return RING_FILE_STORE_ERR_DUPLICATE_KEY;
-  }
-
-  uint64_t seq = handle->nextSeq++;
-  err = rfsStage(handle, key, seq, 0, (const uint8_t *)record);
+  uint64_t order = 0;
+  err = rfsBuildRecordLocked(handle, timeStamp, record, handle->recBuf, &order);
 
   if (err == ESP_OK)
   {
-    handle->count =
-        (handle->count < handle->capacity) ? handle->count + 1u : handle->capacity;
-    handle->mutationStamp++;
-
-    if (handle->maxPending == 1)
-    {
-      err = rfsFlushPending(handle, true);
-    }
+    uint8_t key[8];
+    rfsPutU64(key, rfsKeyOfRecord(handle->recBuf));
+    err = rfsTimeAddLocked(handle, key, order, handle->recBuf);
   }
 
   RFS_EXIT(handle);
   return err;
 }
 
-esp_err_t ringFileReadByKey(ringFileHandle_t *handle, const void *key,
+esp_err_t ringFileReadByKey(ringFileHandle_t *handle, uint64_t usedKey,
                             void *outRecord)
 {
-  if (handle == NULL || key == NULL || outRecord == NULL)
+  if (handle == NULL || outRecord == NULL)
   {
     return ESP_ERR_INVALID_ARG;
   }
 
   RFS_ENTER(handle);
 
-  if (!rfsKeyBytesValid(handle, (const uint8_t *)key))
-  {
-    RFS_EXIT(handle);
-    return ESP_ERR_INVALID_ARG;
-  }
+  uint8_t key[8];
+  rfsPutU64(key, usedKey);
 
   rfsMember_t member;
 
-  if (!rfsFindActive(handle, (const uint8_t *)key, &member))
+  if (!rfsFindActive(handle, key, &member))
   {
     RFS_EXIT(handle);
     return RING_FILE_STORE_ERR_KEY_NOT_FOUND;
@@ -2311,15 +2171,7 @@ esp_err_t ringFileReadByKey(ringFileHandle_t *handle, const void *key,
 static esp_err_t rfsUpdateLocked(ringFileHandle_t *handle, const uint8_t *key,
                                  const uint8_t *record)
 {
-  uint8_t embedded[RFS_MAX_KEY_SIZE];
-  rfsExtractKey(handle, record, embedded);
-
-  if (!rfsKeyBytesValid(handle, key) || !rfsKeyBytesValid(handle, embedded))
-  {
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  if (!rfsKeyEqual(handle, key, embedded))
+  if (rfsGetU64(key) != rfsKeyOfRecord(record))
   {
     return ESP_ERR_INVALID_ARG;
   }
@@ -2360,27 +2212,8 @@ static esp_err_t rfsUpdateLocked(ringFileHandle_t *handle, const uint8_t *key,
   return err;
 }
 
-esp_err_t ringFileUpdateByKey(ringFileHandle_t *handle, const void *key,
-                              const void *record)
-{
-  if (handle == NULL || key == NULL || record == NULL)
-  {
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  RFS_ENTER(handle);
-  esp_err_t err = rfsCheckWritable(handle);
-
-  if (err == ESP_OK)
-  {
-    err = rfsUpdateLocked(handle, (const uint8_t *)key, (const uint8_t *)record);
-  }
-
-  RFS_EXIT(handle);
-  return err;
-}
-
-esp_err_t ringFileUpsert(ringFileHandle_t *handle, const void *record)
+esp_err_t ringFileUpdateByKey(ringFileHandle_t *handle, uint64_t usedKey,
+                              uint64_t timeStamp, const void *record)
 {
   if (handle == NULL || record == NULL)
   {
@@ -2396,46 +2229,20 @@ esp_err_t ringFileUpsert(ringFileHandle_t *handle, const void *record)
     return err;
   }
 
-  uint8_t key[RFS_MAX_KEY_SIZE];
-  rfsExtractKey(handle, (const uint8_t *)record, key);
+  err = rfsBuildRecordLocked(handle, timeStamp, record, handle->recBuf, NULL);
 
-  if (!rfsKeyBytesValid(handle, key))
+  if (err == ESP_OK)
   {
-    RFS_EXIT(handle);
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  if (rfsIsTimeBucket(handle))
-  {
-    //-- Update the record of an active bucket (any timeStamp: the last
-    //-- added record stays updatable while time stays in its bucket);
-    //-- otherwise the add rules apply.
-    err = rfsTimeAddLocked(handle, key, (const uint8_t *)record);
-    RFS_EXIT(handle);
-    return err;
-  }
-
-  rfsMember_t member;
-
-  if (rfsFindActive(handle, key, &member))
-  {
-    err = rfsUpdateLocked(handle, key, (const uint8_t *)record);
-  }
-  else
-  {
-    uint64_t seq = handle->nextSeq++;
-    err = rfsStage(handle, key, seq, 0, (const uint8_t *)record);
-
-    if (err == ESP_OK)
+    if (rfsKeyOfRecord(handle->recBuf) != usedKey)
     {
-      handle->count = (handle->count < handle->capacity) ? handle->count + 1u
-                                                         : handle->capacity;
-      handle->mutationStamp++;
-
-      if (handle->maxPending == 1)
-      {
-        err = rfsFlushPending(handle, true);
-      }
+      //-- The usedKey derived from timeStamp must match the lookup key.
+      err = ESP_ERR_INVALID_ARG;
+    }
+    else
+    {
+      uint8_t key[8];
+      rfsPutU64(key, usedKey);
+      err = rfsUpdateLocked(handle, key, handle->recBuf);
     }
   }
 
@@ -2443,7 +2250,8 @@ esp_err_t ringFileUpsert(ringFileHandle_t *handle, const void *record)
   return err;
 }
 
-esp_err_t ringFileEdit(ringFileHandle_t *handle, const void *record)
+esp_err_t ringFileUpsert(ringFileHandle_t *handle, uint64_t timeStamp,
+                         const void *record)
 {
   if (handle == NULL || record == NULL)
   {
@@ -2459,37 +2267,70 @@ esp_err_t ringFileEdit(ringFileHandle_t *handle, const void *record)
     return err;
   }
 
-  if (!rfsIsTimeBucket(handle))
+  uint64_t order = 0;
+  err = rfsBuildRecordLocked(handle, timeStamp, record, handle->recBuf, &order);
+
+  if (err == ESP_OK)
   {
-    RFS_EXIT(handle);
-    return ESP_ERR_INVALID_STATE;
+    uint8_t key[8];
+    rfsPutU64(key, rfsKeyOfRecord(handle->recBuf));
+    err = rfsTimeAddLocked(handle, key, order, handle->recBuf);
   }
 
-  uint8_t key[RFS_MAX_KEY_SIZE];
-  rfsExtractKey(handle, (const uint8_t *)record, key);
-  uint64_t bucket = rfsGetU64(key);
+  RFS_EXIT(handle);
+  return err;
+}
+
+esp_err_t ringFileEdit(ringFileHandle_t *handle, uint64_t timeStamp,
+                       const void *record)
+{
+  if (handle == NULL || record == NULL)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  RFS_ENTER(handle);
+  esp_err_t err = rfsCheckWritable(handle);
+
+  if (err != ESP_OK)
+  {
+    RFS_EXIT(handle);
+    return err;
+  }
+
+  uint64_t order = 0;
+  err = rfsBuildRecordLocked(handle, timeStamp, record, handle->recBuf, &order);
+
+  if (err != ESP_OK)
+  {
+    RFS_EXIT(handle);
+    return err;
+  }
+
+  uint8_t key[8];
+  rfsPutU64(key, rfsKeyOfRecord(handle->recBuf));
 
   rfsMember_t member;
 
   if (rfsFindActive(handle, key, &member))
   {
     //-- Backfill an active bucket with any timestamp.
-    err = rfsUpdateLocked(handle, key, (const uint8_t *)record);
+    err = rfsUpdateLocked(handle, key, handle->recBuf);
     RFS_EXIT(handle);
     return err;
   }
 
-  uint64_t newestBucket = 0;
+  uint64_t newestOrder = 0;
 
-  if (rfsMaxBucketLocked(handle, &newestBucket))
+  if (rfsMaxOrderLocked(handle, &newestOrder))
   {
     //-- Insertable only inside the retained window; older buckets were
     //-- evicted long ago. An empty ring accepts any bucket.
-    uint64_t windowLow = (newestBucket + 1u > handle->capacity)
-                             ? (newestBucket - handle->capacity + 1u)
+    uint64_t windowLow = (newestOrder + 1u > handle->capacity)
+                             ? (newestOrder - handle->capacity + 1u)
                              : 0u;
 
-    if (bucket < windowLow)
+    if (order < windowLow)
     {
       RFS_EXIT(handle);
       return RING_FILE_STORE_ERR_BUCKET_OUT_OF_RANGE;
@@ -2497,7 +2338,7 @@ esp_err_t ringFileEdit(ringFileHandle_t *handle, const void *record)
   }
 
   uint64_t seq = handle->nextSeq++;
-  err = rfsStage(handle, key, seq, 0, (const uint8_t *)record);
+  err = rfsStage(handle, key, seq, 0, handle->recBuf);
 
   if (err == ESP_OK)
   {
@@ -2536,7 +2377,7 @@ static esp_err_t rfsReadEndLocked(ringFileHandle_t *handle, void *outRecord,
     }
 
     rfsExtractKey(handle, handle->slotBuf, handle->keyBufB);
-    uint64_t hdrBucket = rfsIsTimeBucket(handle) ? rfsGetU64(handle->keyBufB) : 0;
+    uint64_t order = rfsOrderOfRecord(handle, handle->slotBuf);
 
     rfsMember_t cand;
     rfsBestCopy(handle, handle->keyBufB, &cand);
@@ -2546,12 +2387,10 @@ static esp_err_t rfsReadEndLocked(ringFileHandle_t *handle, void *outRecord,
       continue;
     }
 
-    if (rfsRankGreater(handle, hdr.seq, hdrBucket) >= handle->capacity)
+    if (rfsRankGreater(handle, order) >= handle->capacity)
     {
       continue;
     }
-
-    uint64_t order = rfsOrderOf(handle, hdr.seq, hdrBucket);
 
     if (!found || (oldest ? order < bestOrder : order > bestOrder))
     {
@@ -2568,11 +2407,9 @@ static esp_err_t rfsReadEndLocked(ringFileHandle_t *handle, void *outRecord,
       continue;
     }
 
-    uint64_t pBucket =
-        rfsIsTimeBucket(handle) ? rfsBucketOfPending(handle, p) : 0;
+    uint64_t order = rfsOrderOfPending(handle, p);
 
-    if (rfsRankGreater(handle, handle->pending[p].seq, pBucket) >=
-        handle->capacity)
+    if (rfsRankGreater(handle, order) >= handle->capacity)
     {
       continue;
     }
@@ -2584,9 +2421,7 @@ static esp_err_t rfsReadEndLocked(ringFileHandle_t *handle, void *outRecord,
     cand.rev = handle->pending[p].rev;
     cand.pending = true;
     cand.pendingIndex = p;
-    cand.bucket = pBucket;
-
-    uint64_t order = rfsOrderOf(handle, cand.seq, pBucket);
+    cand.order = order;
 
     if (!found || (oldest ? order < bestOrder : order > bestOrder))
     {
@@ -2630,9 +2465,10 @@ esp_err_t ringFileReadNewest(ringFileHandle_t *handle, void *outRecord)
   return err;
 }
 
-//-- Locate the committed member with the smallest seq greater than (or,
+//-- Locate the committed member with the smallest period greater than (or,
 //-- when inclusive, equal to) 'cursor' in forward direction, or the largest
-//-- seq smaller than 'cursor' backwards.
+//-- period smaller than 'cursor' backwards. Distinct keys have distinct
+//-- periods, so the cursor needs no tie-breaker.
 static bool rfsFindNeighbor(ringFileHandle_t *handle, uint64_t cursor, bool dirNext,
                             bool inclusive, rfsMember_t *out)
 {
@@ -2650,8 +2486,7 @@ static bool rfsFindNeighbor(ringFileHandle_t *handle, uint64_t cursor, bool dirN
     }
 
     rfsExtractKey(handle, handle->slotBuf, handle->keyBufB);
-    uint64_t hdrBucket = rfsIsTimeBucket(handle) ? rfsGetU64(handle->keyBufB) : 0;
-    uint64_t order = rfsOrderOf(handle, hdr.seq, hdrBucket);
+    uint64_t order = rfsOrderOfRecord(handle, handle->slotBuf);
 
     bool passes;
 
@@ -2677,7 +2512,7 @@ static bool rfsFindNeighbor(ringFileHandle_t *handle, uint64_t cursor, bool dirN
       continue;
     }
 
-    if (rfsRankGreater(handle, hdr.seq, hdrBucket) >= handle->capacity)
+    if (rfsRankGreater(handle, order) >= handle->capacity)
     {
       continue;
     }
@@ -2698,9 +2533,7 @@ static bool rfsFindNeighbor(ringFileHandle_t *handle, uint64_t cursor, bool dirN
     }
 
     uint64_t pseq = handle->pending[p].seq;
-    uint64_t pBucket =
-        rfsIsTimeBucket(handle) ? rfsBucketOfPending(handle, p) : 0;
-    uint64_t order = rfsOrderOf(handle, pseq, pBucket);
+    uint64_t order = rfsOrderOfPending(handle, p);
     bool passes;
 
     if (dirNext)
@@ -2717,7 +2550,7 @@ static bool rfsFindNeighbor(ringFileHandle_t *handle, uint64_t cursor, bool dirN
       continue;
     }
 
-    if (rfsRankGreater(handle, pseq, pBucket) >= handle->capacity)
+    if (rfsRankGreater(handle, order) >= handle->capacity)
     {
       continue;
     }
@@ -2729,7 +2562,7 @@ static bool rfsFindNeighbor(ringFileHandle_t *handle, uint64_t cursor, bool dirN
     cand.rev = handle->pending[p].rev;
     cand.pending = true;
     cand.pendingIndex = p;
-    cand.bucket = pBucket;
+    cand.order = order;
 
     if (!found || (dirNext ? order < outOrder : order > outOrder))
     {
@@ -2744,15 +2577,15 @@ static bool rfsFindNeighbor(ringFileHandle_t *handle, uint64_t cursor, bool dirN
 
 esp_err_t ringFileIteratorBegin(ringFileHandle_t *handle,
                                 ringFileIterator_t *iterator,
-                                ringFileIterStart_t start, const void *key,
-                                void *outRecord)
+                                ringFileIterStart_t start,
+                                const uint64_t *usedKey, void *outRecord)
 {
   if (handle == NULL || iterator == NULL || outRecord == NULL)
   {
     return ESP_ERR_INVALID_ARG;
   }
 
-  if (start == RING_FILE_ITER_KEY && key == NULL)
+  if (start == RING_FILE_ITER_KEY && usedKey == NULL)
   {
     return ESP_ERR_INVALID_ARG;
   }
@@ -2764,13 +2597,10 @@ esp_err_t ringFileIteratorBegin(ringFileHandle_t *handle,
 
   if (start == RING_FILE_ITER_KEY)
   {
-    if (!rfsKeyBytesValid(handle, (const uint8_t *)key))
-    {
-      RFS_EXIT(handle);
-      return ESP_ERR_INVALID_ARG;
-    }
+    uint8_t key[8];
+    rfsPutU64(key, *usedKey);
 
-    if (!rfsFindActive(handle, (const uint8_t *)key, &member))
+    if (!rfsFindActive(handle, key, &member))
     {
       RFS_EXIT(handle);
       return RING_FILE_STORE_ERR_KEY_NOT_FOUND;
@@ -2797,9 +2627,8 @@ esp_err_t ringFileIteratorBegin(ringFileHandle_t *handle,
 
   if (err == ESP_OK)
   {
-    //-- The cursor holds the order value: seq in insertion mode, bucketId
-    //-- in TIMEBUCKET mode.
-    iterator->cursorSeq = rfsOrderOf(handle, member.seq, member.bucket);
+    //-- The cursor holds the period of the last returned record.
+    iterator->cursorOrder = member.order;
     iterator->stamp = handle->mutationStamp;
     iterator->slot = rfsSlotReportOf(handle, &member);
     iterator->begun = true;
@@ -2828,7 +2657,7 @@ static esp_err_t rfsIteratorStep(ringFileHandle_t *handle,
   rfsMember_t member;
   memset(&member, 0, sizeof(member));
 
-  if (!rfsFindNeighbor(handle, iterator->cursorSeq, dirNext, false, &member))
+  if (!rfsFindNeighbor(handle, iterator->cursorOrder, dirNext, false, &member))
   {
     RFS_EXIT(handle);
     return RING_FILE_STORE_ERR_ITER_END;
@@ -2838,7 +2667,7 @@ static esp_err_t rfsIteratorStep(ringFileHandle_t *handle,
 
   if (err == ESP_OK)
   {
-    iterator->cursorSeq = rfsOrderOf(handle, member.seq, member.bucket);
+    iterator->cursorOrder = member.order;
     iterator->slot = rfsSlotReportOf(handle, &member);
   }
 
@@ -2900,17 +2729,14 @@ esp_err_t ringFileGetInfo(ringFileHandle_t *handle, ringFileInfo_t *outInfo)
   RFS_ENTER(handle);
   outInfo->count = handle->count;
   outInfo->capacity = handle->capacity;
+  outInfo->payloadSize = handle->payloadSize;
   outInfo->recordSize = handle->recordSize;
-  outInfo->schemaId = handle->schemaId;
-  outInfo->schemaVersion = handle->schemaVersion;
   outInfo->storageSize =
       (uint64_t)RFS_HEADER_SIZE + (uint64_t)rfsSlotCount(handle) * handle->slotSize;
   outInfo->pendingCount = handle->pendingCount;
   outInfo->dirty = handle->dirty || handle->pendingEpochChange;
-  outInfo->keyPositionMask = handle->keyMask;
-  outInfo->addressing = (ringFileAddressingMode_t)handle->addressingMode;
+  memcpy(outInfo->schemaId, handle->schemaId, sizeof(outInfo->schemaId));
   outInfo->granularity = (ringFileGranularity_t)handle->granularity;
-  outInfo->timestampOffset = handle->timestampOffset;
   RFS_EXIT(handle);
   return ESP_OK;
 }
@@ -2982,7 +2808,8 @@ esp_err_t ringFileClear(ringFileHandle_t *handle)
 }
 
 //-- k-th oldest committed member (0 = oldest). Streaming selection with
-//-- bounded RAM: each step rescans for the smallest seq above the previous.
+//-- bounded RAM: each step rescans for the smallest period above the
+//-- previous.
 static bool rfsFindKthOldest(ringFileHandle_t *h, uint32_t k, rfsMember_t *out)
 {
   bool havePrev = false;
@@ -3006,8 +2833,7 @@ static bool rfsFindKthOldest(ringFileHandle_t *h, uint32_t k, rfsMember_t *out)
       }
 
       rfsExtractKey(h, h->slotBuf, h->keyBufB);
-      uint64_t hdrBucket = rfsIsTimeBucket(h) ? rfsGetU64(h->keyBufB) : 0;
-      uint64_t order = rfsOrderOf(h, hdr.seq, hdrBucket);
+      uint64_t order = rfsOrderOfRecord(h, h->slotBuf);
 
       if (havePrev && order <= prev)
       {
@@ -3022,7 +2848,7 @@ static bool rfsFindKthOldest(ringFileHandle_t *h, uint32_t k, rfsMember_t *out)
         continue;
       }
 
-      if (rfsRankGreater(h, hdr.seq, hdrBucket) >= h->capacity)
+      if (rfsRankGreater(h, order) >= h->capacity)
       {
         continue;
       }
@@ -3043,15 +2869,14 @@ static bool rfsFindKthOldest(ringFileHandle_t *h, uint32_t k, rfsMember_t *out)
       }
 
       uint64_t pseq = h->pending[p].seq;
-      uint64_t pBucket = rfsIsTimeBucket(h) ? rfsBucketOfPending(h, p) : 0;
-      uint64_t order = rfsOrderOf(h, pseq, pBucket);
+      uint64_t order = rfsOrderOfPending(h, p);
 
       if (havePrev && order <= prev)
       {
         continue;
       }
 
-      if (rfsRankGreater(h, pseq, pBucket) >= h->capacity)
+      if (rfsRankGreater(h, order) >= h->capacity)
       {
         continue;
       }
@@ -3063,7 +2888,7 @@ static bool rfsFindKthOldest(ringFileHandle_t *h, uint32_t k, rfsMember_t *out)
       cand.rev = h->pending[p].rev;
       cand.pending = true;
       cand.pendingIndex = p;
-      cand.bucket = pBucket;
+      cand.order = order;
 
       if (!found || order < bestOrder)
       {
@@ -3087,7 +2912,7 @@ static bool rfsFindKthOldest(ringFileHandle_t *h, uint32_t k, rfsMember_t *out)
 }
 
 //-- k-th record to stream into the resize candidate. The candidate holds
-//-- the newest 'retained' members in insertion order, so the first
+//-- the newest 'retained' members in bucket (period) order, so the first
 //-- (count - retained) oldest members are skipped on a shrink.
 static bool rfsFindRetainedMember(ringFileHandle_t *h, uint32_t k,
                                   uint32_t retained, rfsMember_t *out)
@@ -3227,8 +3052,9 @@ esp_err_t ringFileResize(ringFileHandle_t *handle, uint32_t newCapacity)
 
     if (rfsProbeHeader(vfd, &probe) == ESP_OK && probe.capacity == newCapacity &&
         probe.recordSize == handle->recordSize &&
-        probe.schemaId == handle->schemaId &&
-        probe.schemaVersion == handle->schemaVersion)
+        probe.payloadSize == handle->payloadSize &&
+        probe.granularity == handle->granularity &&
+        strcmp(probe.schemaId, handle->schemaId) == 0)
     {
       candidateOk = true;
     }
@@ -3383,6 +3209,7 @@ esp_err_t ringFileValidate(const char *path, ringFileValidation_t *outValidation
     free(probe.slotBuf);
     free(probe.keyBufA);
     free(probe.keyBufB);
+    free(probe.recBuf);
   }
 
   rfsIoClose(fd);

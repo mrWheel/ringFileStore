@@ -1,7 +1,7 @@
 //--
-//-- FileVersion: [1] 19-11-2026 - 09:06
+//-- FileVersion: [2] 19-11-2026 - 11:40
 //--
-//-- ringFileStore - timestamp helpers for TIMEBUCKET addressing.
+//-- ringFileStore - timestamp helpers for the timestamp key model.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
 //--
 #include <stdio.h>
@@ -12,16 +12,18 @@
 
 //---------------------------------------------------------------------
 //-- Time basis: the local wall clock is treated as if it were UTC
-//-- (DSMRlogger32-compatible); daylight saving time is ignored. All
-//-- formulas are fixed by the DSMRlogger32 baseline:
-//--   HOUR   bucketId = unixSeconds / 3600
-//--   DAY    bucketId = unixSeconds / 86400
-//--   WEEK   bucketId = (unixSeconds + 259200) / 604800
-//--          (boundaries at Monday 00:00; 259200 s shifts the Thursday
-//--          1970-01-01 epoch onto the Monday 1969-12-29 week origin)
-//--   MONTH  bucketId = (EEYY - 1) * 12 + MM
-//-- The string form is "EEYYMMDDHHMMSS" with the century fixed to "20"
-//-- (years 2000-2099).
+//-- (DSMRlogger32-compatible); daylight saving time is ignored. The
+//-- numeric timestamp form is the 14-digit EEYYMMDDhhmmss value with the
+//-- century fixed to "20" (years 2000-2099), back-filled with "00"
+//-- values below the file type. Period formulas ("berekende waarde",
+//-- fixed by the DSMRlogger32 baseline, days = days since 1970-01-01):
+//--   YEAR    year
+//--   MONTH   (year - 1) * 12 + month
+//--   DAY     days
+//--   HOUR    days * 24 + hour
+//--   MINUTE  days * 1440 + hour * 60 + minute
+//--   SECOND  days * 86400 + hour * 3600 + minute * 60 + second
+//-- bucketId (the DSMRlogger-style logical slot) is period % capacity.
 //---------------------------------------------------------------------
 
 #define RFS_TIME_SECONDS_PER_DAY 86400ull
@@ -191,44 +193,310 @@ bool rfsTimeUnixToTimeStampString(uint64_t unixSeconds, char outTimeStamp[15])
 
 bool rfsTimeUnixToBucketId(uint64_t unixSeconds,
                            ringFileGranularity_t granularity,
-                           uint64_t *outBucketId)
+                           uint64_t *outPeriod)
 {
-  if (outBucketId == NULL)
+  if (outPeriod == NULL ||
+      unixSeconds > RFS_TIME_UNIX_2099_12_31_END)
+  {
+    return false;
+  }
+
+  int64_t days = (int64_t)(unixSeconds / RFS_TIME_SECONDS_PER_DAY);
+  uint64_t rest = unixSeconds % RFS_TIME_SECONDS_PER_DAY;
+  uint32_t hour = (uint32_t)(rest / RFS_TIME_SECONDS_PER_HOUR);
+  uint32_t minute =
+      (uint32_t)((rest % RFS_TIME_SECONDS_PER_HOUR) / RFS_TIME_SECONDS_PER_MINUTE);
+  uint32_t second = (uint32_t)(rest % RFS_TIME_SECONDS_PER_MINUTE);
+  int64_t year = 0;
+  uint32_t month = 0, day = 0;
+  rfsTimeCivilFromDays(days, &year, &month, &day);
+
+  switch (granularity)
+  {
+    case RING_FILE_GRANULARITY_YEAR:
+      *outPeriod = (uint64_t)year;
+      return true;
+
+    case RING_FILE_GRANULARITY_MONTH:
+      //-- DSMRlogger32 month formula (before the modulo addressing).
+      *outPeriod = (uint64_t)(year - 1) * 12u + (uint64_t)month;
+      return true;
+
+    case RING_FILE_GRANULARITY_DAY:
+      *outPeriod = (uint64_t)days;
+      return true;
+
+    case RING_FILE_GRANULARITY_HOUR:
+      *outPeriod = (uint64_t)days * 24u + (uint64_t)hour;
+      return true;
+
+    case RING_FILE_GRANULARITY_MINUTE:
+      *outPeriod = (uint64_t)days * 1440u + (uint64_t)hour * 60u +
+                   (uint64_t)minute;
+      return true;
+
+    case RING_FILE_GRANULARITY_SECOND:
+      *outPeriod = (uint64_t)days * RFS_TIME_SECONDS_PER_DAY +
+                   (uint64_t)hour * RFS_TIME_SECONDS_PER_HOUR +
+                   (uint64_t)minute * RFS_TIME_SECONDS_PER_MINUTE +
+                   (uint64_t)second;
+      return true;
+
+    default:
+      return false;
+  }
+}
+
+//-- ---------------------------------------------------------------------------
+//-- Digit-based helpers behind the timestamp key model.
+//-- ---------------------------------------------------------------------------
+
+//-- Digit divisors for the truncation to a usedKey (10 ^ digits below the
+//-- granularity) and for padding a usedKey back to 14 digits.
+static bool rfsTimeGranularityDivisors(ringFileGranularity_t granularity,
+                                       uint64_t *outTruncateDivisor,
+                                       uint64_t *outPadDivisor)
+{
+  switch (granularity)
+  {
+    //-- A 14-digit EEYYMMDDhhmmss value: the usedKey keeps 4 + 2*k leading
+    //-- digits, so truncate = pad = 10^(10 - 2*k).
+    case RING_FILE_GRANULARITY_YEAR:
+      *outTruncateDivisor = 10000000000ull;
+      *outPadDivisor = 10000000000ull;
+      return true;
+
+    case RING_FILE_GRANULARITY_MONTH:
+      *outTruncateDivisor = 100000000ull;
+      *outPadDivisor = 100000000ull;
+      return true;
+
+    case RING_FILE_GRANULARITY_DAY:
+      *outTruncateDivisor = 1000000ull;
+      *outPadDivisor = 1000000ull;
+      return true;
+
+    case RING_FILE_GRANULARITY_HOUR:
+      *outTruncateDivisor = 10000ull;
+      *outPadDivisor = 10000ull;
+      return true;
+
+    case RING_FILE_GRANULARITY_MINUTE:
+      *outTruncateDivisor = 100ull;
+      *outPadDivisor = 100ull;
+      return true;
+
+    case RING_FILE_GRANULARITY_SECOND:
+      *outTruncateDivisor = 1ull;
+      *outPadDivisor = 1ull;
+      return true;
+
+    default:
+      return false;
+  }
+}
+
+bool rfsTimeSchemaIdToGranularity(const char *schemaId,
+                                  ringFileGranularity_t *outGranularity)
+{
+  if (schemaId == NULL || outGranularity == NULL)
+  {
+    return false;
+  }
+
+  if (strcmp(schemaId, RING_FILE_SCHEMA_YY) == 0)
+  {
+    *outGranularity = RING_FILE_GRANULARITY_YEAR;
+    return true;
+  }
+
+  if (strcmp(schemaId, RING_FILE_SCHEMA_YYMM) == 0)
+  {
+    *outGranularity = RING_FILE_GRANULARITY_MONTH;
+    return true;
+  }
+
+  if (strcmp(schemaId, RING_FILE_SCHEMA_YYMMDD) == 0)
+  {
+    *outGranularity = RING_FILE_GRANULARITY_DAY;
+    return true;
+  }
+
+  if (strcmp(schemaId, RING_FILE_SCHEMA_YYMMDDHH) == 0)
+  {
+    *outGranularity = RING_FILE_GRANULARITY_HOUR;
+    return true;
+  }
+
+  if (strcmp(schemaId, RING_FILE_SCHEMA_YYMMDDHHMM) == 0)
+  {
+    *outGranularity = RING_FILE_GRANULARITY_MINUTE;
+    return true;
+  }
+
+  if (strcmp(schemaId, RING_FILE_SCHEMA_YYMMDDHHMMSS) == 0)
+  {
+    *outGranularity = RING_FILE_GRANULARITY_SECOND;
+    return true;
+  }
+
+  return false;
+}
+
+bool rfsTimeDigitsValid(uint64_t timeStamp, ringFileGranularity_t granularity)
+{
+  if (granularity < RING_FILE_GRANULARITY_YEAR ||
+      granularity > RING_FILE_GRANULARITY_SECOND)
+  {
+    return false;
+  }
+
+  //-- Exactly 14 digits with the century fixed to "20".
+  if (timeStamp < 20000000000000ull || timeStamp > 20999999999999ull)
+  {
+    return false;
+  }
+
+  uint32_t year = (uint32_t)(timeStamp / 10000000000ull);
+  uint32_t month = (uint32_t)((timeStamp / 100000000ull) % 100ull);
+  uint32_t day = (uint32_t)((timeStamp / 1000000ull) % 100ull);
+  uint32_t hour = (uint32_t)((timeStamp / 10000ull) % 100ull);
+  uint32_t minute = (uint32_t)((timeStamp / 100ull) % 100ull);
+  uint32_t second = (uint32_t)(timeStamp % 100ull);
+
+  if (hour > 23u || minute > 59u || second > 59u)
+  {
+    return false;
+  }
+
+  //-- Fields at or above the granularity must be valid; fields below it
+  //-- accept zero padding or a valid value.
+  if (granularity >= RING_FILE_GRANULARITY_MONTH)
+  {
+    if (month < 1u || month > 12u)
+    {
+      return false;
+    }
+  }
+  else if (month > 12u)
+  {
+    return false;
+  }
+
+  int64_t days = 0;
+  bool dayValid = rfsTimeDaysFromCivil((int64_t)year, month == 0u ? 1u : month,
+                                       day == 0u ? 1u : day, &days);
+
+  if (granularity >= RING_FILE_GRANULARITY_DAY)
+  {
+    if (day < 1u || !rfsTimeDaysFromCivil((int64_t)year, month, day, &days))
+    {
+      return false;
+    }
+  }
+  else if (day != 0u && !dayValid)
+  {
+    return false;
+  }
+
+  return true;
+}
+
+bool rfsTimeDigitsToUsedKey(uint64_t timeStamp,
+                            ringFileGranularity_t granularity,
+                            uint64_t *outUsedKey)
+{
+  uint64_t truncate = 0;
+  uint64_t pad = 0;
+
+  if (outUsedKey == NULL || !rfsTimeGranularityDivisors(granularity, &truncate, &pad) ||
+      !rfsTimeDigitsValid(timeStamp, granularity))
+  {
+    return false;
+  }
+
+  *outUsedKey = timeStamp / truncate;
+  return true;
+}
+
+bool rfsTimeDigitsToPeriod(uint64_t timeStamp,
+                           ringFileGranularity_t granularity,
+                           uint64_t *outPeriod)
+{
+  if (outPeriod == NULL || !rfsTimeDigitsValid(timeStamp, granularity))
+  {
+    return false;
+  }
+
+  uint32_t year = (uint32_t)(timeStamp / 10000000000ull);
+  uint32_t month = (uint32_t)((timeStamp / 100000000ull) % 100ull);
+  uint32_t day = (uint32_t)((timeStamp / 1000000ull) % 100ull);
+  uint32_t hour = (uint32_t)((timeStamp / 10000ull) % 100ull);
+  uint32_t minute = (uint32_t)((timeStamp / 100ull) % 100ull);
+  uint32_t second = (uint32_t)(timeStamp % 100ull);
+
+  switch (granularity)
+  {
+    case RING_FILE_GRANULARITY_YEAR:
+      *outPeriod = (uint64_t)year;
+      return true;
+
+    case RING_FILE_GRANULARITY_MONTH:
+      //-- DSMRlogger32 month formula (before the modulo addressing).
+      *outPeriod = (uint64_t)(year - 1) * 12u + (uint64_t)month;
+      return true;
+
+    default:
+      break;
+  }
+
+  int64_t days = 0;
+
+  if (!rfsTimeDaysFromCivil((int64_t)year, month, day, &days))
   {
     return false;
   }
 
   switch (granularity)
   {
-    case RING_FILE_GRANULARITY_HOUR:
-      *outBucketId = unixSeconds / RFS_TIME_SECONDS_PER_HOUR;
-      return true;
-
     case RING_FILE_GRANULARITY_DAY:
-      *outBucketId = unixSeconds / RFS_TIME_SECONDS_PER_DAY;
+      *outPeriod = (uint64_t)days;
       return true;
 
-    case RING_FILE_GRANULARITY_WEEK:
-      //-- Monday-aligned: the 1970-01-01 (Thursday) epoch is shifted to
-      //-- the Monday 1969-12-29 week origin.
-      *outBucketId =
-          (unixSeconds + RFS_TIME_WEEK_OFFSET_SECONDS) / RFS_TIME_WEEK_LENGTH_SECONDS;
+    case RING_FILE_GRANULARITY_HOUR:
+      *outPeriod = (uint64_t)days * 24u + (uint64_t)hour;
       return true;
 
-    case RING_FILE_GRANULARITY_MONTH:
-    {
-      int64_t year = 0;
-      uint32_t month = 0, day = 0;
-      rfsTimeCivilFromDays((int64_t)(unixSeconds / RFS_TIME_SECONDS_PER_DAY),
-                           &year, &month, &day);
-      //-- DSMRlogger32 month formula (before the modulo addressing).
-      *outBucketId = (uint64_t)(year - 1) * 12u + (uint64_t)month;
+    case RING_FILE_GRANULARITY_MINUTE:
+      *outPeriod = (uint64_t)days * 1440u + (uint64_t)hour * 60u +
+                   (uint64_t)minute;
       return true;
-    }
+
+    case RING_FILE_GRANULARITY_SECOND:
+      *outPeriod = (uint64_t)days * RFS_TIME_SECONDS_PER_DAY +
+                   (uint64_t)hour * RFS_TIME_SECONDS_PER_HOUR +
+                   (uint64_t)minute * RFS_TIME_SECONDS_PER_MINUTE +
+                   (uint64_t)second;
+      return true;
 
     default:
       return false;
   }
+}
+
+bool rfsTimeUsedKeyToPeriod(uint64_t usedKey,
+                            ringFileGranularity_t granularity,
+                            uint64_t *outPeriod)
+{
+  uint64_t truncate = 0;
+  uint64_t pad = 0;
+
+  if (outPeriod == NULL || !rfsTimeGranularityDivisors(granularity, &truncate, &pad))
+  {
+    return false;
+  }
+
+  return rfsTimeDigitsToPeriod(usedKey * pad, granularity, outPeriod);
 }
 
 bool rfsTimeUnixToIsoWeek(uint64_t unixSeconds, uint32_t *outIsoYear,
@@ -298,9 +566,44 @@ esp_err_t ringFileUnixToTimeStampString(uint64_t unixSeconds,
 
 esp_err_t ringFileUnixToBucketId(uint64_t unixSeconds,
                                  ringFileGranularity_t granularity,
-                                 uint64_t *outBucketId)
+                                 uint64_t *outPeriod)
 {
-  if (!rfsTimeUnixToBucketId(unixSeconds, granularity, outBucketId))
+  if (!rfsTimeUnixToBucketId(unixSeconds, granularity, outPeriod))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  return ESP_OK;
+}
+
+esp_err_t ringFileGranularityFromSchemaId(const char *schemaId,
+                                          ringFileGranularity_t *outGranularity)
+{
+  if (!rfsTimeSchemaIdToGranularity(schemaId, outGranularity))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  return ESP_OK;
+}
+
+esp_err_t ringFileTimeStampToUsedKey(uint64_t timeStamp,
+                                     ringFileGranularity_t granularity,
+                                     uint64_t *outUsedKey)
+{
+  if (!rfsTimeDigitsToUsedKey(timeStamp, granularity, outUsedKey))
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  return ESP_OK;
+}
+
+esp_err_t ringFileTimeStampToPeriod(uint64_t timeStamp,
+                                    ringFileGranularity_t granularity,
+                                    uint64_t *outPeriod)
+{
+  if (!rfsTimeDigitsToPeriod(timeStamp, granularity, outPeriod))
   {
     return ESP_ERR_INVALID_ARG;
   }

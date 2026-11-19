@@ -1,7 +1,7 @@
 //--
-//-- FileVersion: [1] 19-11-2026 - 09:06
+//-- FileVersion: [2] 19-11-2026 - 11:40
 //--
-//-- ringFileStore - timestamp helpers for TIMEBUCKET addressing.
+//-- ringFileStore - timestamp helpers for the timestamp key model.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
 //--
 #ifndef RFS_TIME_H
@@ -34,6 +34,35 @@ void rfsTimeCivilFromDays(int64_t days, int64_t *outYear, uint32_t *outMonth,
 //-- them without esp_err_t mapping.
 //-- ---------------------------------------------------------------------------
 
+//-- Map a file type string ("YY".."YYMMDDhhmmss") to its granularity.
+bool rfsTimeSchemaIdToGranularity(const char *schemaId,
+                                  ringFileGranularity_t *outGranularity);
+
+//-- Validate a 14-digit EEYYMMDDhhmmss numeric timestamp for a
+//-- granularity. Century must be "20". Fields at or above the granularity
+//-- must be valid (month 01-12, day valid for the month, hour 00-23,
+//-- minute/second 00-59); fields below the granularity accept zero
+//-- padding or a valid value.
+bool rfsTimeDigitsValid(uint64_t timeStamp, ringFileGranularity_t granularity);
+
+//-- usedKey: the timestamp truncated to the granularity digits, e.g.
+//-- 20261118143055 with HOUR gives 2026111814. Validates the digits.
+bool rfsTimeDigitsToUsedKey(uint64_t timeStamp,
+                            ringFileGranularity_t granularity,
+                            uint64_t *outUsedKey);
+
+//-- Period ("berekende waarde") from a validated 14-digit timestamp
+//-- (validates first). See ringFileGranularity_t for the formulas.
+bool rfsTimeDigitsToPeriod(uint64_t timeStamp,
+                           ringFileGranularity_t granularity,
+                           uint64_t *outPeriod);
+
+//-- Period from a usedKey (zero-pads it back to 14 digits, then applies
+//-- rfsTimeDigitsToPeriod()). Returns false for a malformed usedKey.
+bool rfsTimeUsedKeyToPeriod(uint64_t usedKey,
+                            ringFileGranularity_t granularity,
+                            uint64_t *outPeriod);
+
 //-- Parse exactly 14 digits "EEYYMMDDHHMMSS". Century fixed to "20"
 //-- (years 2000-2099), month 01-12, day valid for the month, hour 00-23,
 //-- minute and second 00-59.
@@ -43,11 +72,11 @@ bool rfsTimeStampStringToUnix(const char *timeStamp, uint64_t *outUnixSeconds);
 //-- 2000-01-01 00:00:00 .. 2099-12-31 23:59:59.
 bool rfsTimeUnixToTimeStampString(uint64_t unixSeconds, char outTimeStamp[15]);
 
-//-- bucketId per granularity (see ringFileGranularity_t). Returns false
-//-- for an invalid granularity value.
+//-- Period per granularity from unix seconds (see ringFileGranularity_t).
+//-- Returns false for an invalid granularity value.
 bool rfsTimeUnixToBucketId(uint64_t unixSeconds,
                            ringFileGranularity_t granularity,
-                           uint64_t *outBucketId);
+                           uint64_t *outPeriod);
 
 //-- ISO-8601 week-numbering year and week (weeks start Monday, week 1
 //-- contains the first Thursday).

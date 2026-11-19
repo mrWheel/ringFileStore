@@ -1,5 +1,5 @@
 ```
-FileVersion: [1] 18-11-2026 - 10:11
+FileVersion: [2] 19-11-2026 - 11:40
 ```
 # Implement a persistent ring-file component for ESP-IDF
 
@@ -7,34 +7,87 @@ Implement a reusable ESP-IDF component named `ring_file_store` in readable C for
 
 ## Reference implementation
 
-Review [DSMRlogger32](https://github.com/mrWheel/DSMRlogger32/tree/main/DSMRlogger32), particularly [FSYSstuff.cpp](https://github.com/mrWheel/DSMRlogger32/blob/b9e401a090a2d0f937dcf817570d2a7970852386/DSMRlogger32/src/FSYSstuff.cpp) and [timeStuff.cpp](https://github.com/mrWheel/DSMRlogger32/blob/b9e401a090a2d0f937dcf817570d2a7970852386/DSMRlogger32/src/timeStuff.cpp). The logger stores hour, day and month history in fixed-width CSV slots. It calculates the slot from the period number modulo the configured history depth, then seeks directly to the corresponding file offset. Reuse the fixed-slot storage principle. The new component uses application-defined keys and insertion order, with its own versioned binary format. Legacy DSMR CSV import is outside this implementation.
+Review [DSMRlogger32](https://github.com/mrWheel/DSMRlogger32/tree/main/DSMRlogger32), particularly [FSYSstuff.cpp](https://github.com/mrWheel/DSMRlogger32/blob/b9e401a090a2d0f937dcf817570d2a7970852386/DSMRlogger32/src/FSYSstuff.cpp) and [timeStuff.cpp](https://github.com/mrWheel/DSMRlogger32/blob/b9e401a090a2d0f937dcf817570d2a7970852386/DSMRlogger32/src/timeStuff.cpp). The logger stores hour, day and month history in fixed-width CSV slots. Its first column is the timestamp truncated to the file type (for an hourly file `YYMMDDHH`); the component calculates the slot from the period number modulo the configured history depth, then seeks directly to the corresponding file offset. Reuse the fixed-slot storage principle and the modulo slot addressing. The new component owns the timestamp key handling itself (see "Timestamp keys and file types") and uses its own versioned binary format. Legacy DSMR CSV import is outside this implementation.
 
-## File schema and configuration
+## Timestamp keys and file types
 
-- At creation, the caller supplies the VFS path, maximum record count, schema identifier and version, C record size, and a descriptor for the key field inside that record. The descriptor defines its byte offset, type and size. Use `sizeof` and `offsetof` in the example.
-- Support signed and unsigned fixed-width integers of 8, 16, 32 and 64 bits, fixed-size byte arrays, and bounded null-terminated strings stored in fixed-size character arrays. Compare keys by value. Byte arrays use exact byte equality. Strings are case-sensitive and bytes after the first terminator are ignored. Reject unterminated string keys. Access integer fields without unaligned loads. Document the buffer contract for key arguments.
-- Use caller-owned structs for reads and writes. For the first release, store fixed-size payloads as raw bytes and document that reopening requires the same payload layout, ABI and endianness. Use pointer-free records with fixed-width fields, initialize padding before writing, and require an explicit schema version change when the layout changes. Encode file metadata explicitly, independent of compiler struct padding.
-- Persist the schema and capacity in the file. Validate the expected schema on open. Use capacity from the file on reopen and change it only through an explicit resize. Validate bounds, file length and arithmetic before allocating memory or seeking. Support multiple independent ring files.
+- Every ring file created by this component is timestamp-keyed. The key is never
+  described by the caller: the component always prepends two fields to the
+  stored record. Stored record layout:
+  `[ u64 fullTimeStamp ][ u64 usedKey ][ caller payload bytes ]`.
+  The caller's record struct contains only the payload; the caller never
+  declares or fills the two key fields. Every read operation returns the full
+  record, so both automatically added fields are delivered back to the caller
+  (field 1: the complete timestamp, field 2: the `usedKey`, named after the
+  DSMRlogger32 first-column key such as `YYMMDDHH`).
+- At creation the caller supplies the VFS path, the file type as `schemaId`,
+  the maximum record count and the payload record size. The `schemaId` is one
+  of the fixed strings `"YY"`, `"YYMM"`, `"YYMMDD"`, `"YYMMDDhh"`,
+  `"YYMMDDhhmm"` or `"YYMMDDhhmmss"` (case-sensitive, lower-case `hh`, `mm`,
+  `ss`). The two-digit year is the DSMRlogger32 form; the component stores and
+  receives timestamps in the century-padded `EEYY…` form (century fixed to
+  "20", years 2000–2099).
+- Timestamps are passed and returned as numeric `uint64_t` values in
+  `EEYYMMDDhhmmss` form (14 digits), back-filled with `00` values below the
+  file type: an `EEYYMMDD`-type record for 18-11-2026 is stored as
+  `20261118000000`. Digits below the file-type granularity are validated
+  normally (hour 00–23, minute/second 00–59) but never take part in the key;
+  a caller may keep real sub-granularity digits.
+- `usedKey` (stored field 2) is the timestamp truncated to the file-type
+  digits: for an `YYMMDDhh` file the timestamp `20261118143055` has
+  `usedKey 2026111814`. Key equality, duplicate-bucket detection, keyed
+  reads, keyed iteration and update key matching all compare `usedKey`.
+- Depending on the file type a period value (the DSMRlogger32 "berekende
+  waarde") is calculated from the timestamp; `<periodValue> % <maxRecords>`
+  determines the bucketId, the DSMRlogger-style logical slot reported by the
+  iterator. The period formulas are:
+  | schemaId | period |
+  | --- | --- |
+  | `"YY"` | year |
+  | `"YYMM"` | `(year - 1) * 12 + month` (DSMRlogger32 month formula) |
+  | `"YYMMDD"` | days since 1970-01-01 |
+  | `"YYMMDDhh"` | days since 1970-01-01 * 24 + hour |
+  | `"YYMMDDhhmm"` | days since 1970-01-01 * 1440 + hour * 60 + minute |
+  | `"YYMMDDhhmmss"` | days since 1970-01-01 * 86400 + hour * 3600 + minute * 60 + second |
+  Order, oldest/newest, eviction and resize retention follow the period
+  value; the physical crash-safe slot placement stays with the commit
+  protocol (the reported bucketId is the logical DSMR-style position).
+- Use caller-owned structs for reads and writes. Payloads are stored as raw
+  bytes; document that reopening requires the same payload layout, ABI and
+  endianness. Use pointer-free payload structs with fixed-width fields,
+  initialize padding before writing, and require the application to create a
+  new file (delete the old one) when the payload layout changes. Encode file
+  metadata explicitly, independent of compiler struct padding.
+- Persist the file type (`schemaId` string), granularity and payload size in
+  the file. Validate the expected file type and payload size on open. Use
+  capacity from the file on reopen and change it only through an explicit
+  resize. Validate bounds, file length and arithmetic before allocating memory
+  or seeking. Support multiple independent ring files with different types.
 
 ## Required API and semantics
 
-Use `esp_err_t` and caller-owned output buffers with explicit sizes. Define and document distinct results for an empty ring, key not found, duplicate key, end of iteration, invalidated iterator, invalid arguments, incompatible schema or format, corruption, read-only access and I/O failures. Document memory ownership and error behavior.
+Use `esp_err_t` and caller-owned output buffers with explicit sizes. Define and document distinct results for an empty ring, key not found, end of iteration, invalidated iterator, invalid arguments, incompatible file type or format, corruption, read-only access and I/O failures. Document memory ownership and error behavior.
 
 | Operation | Required behavior |
 | --- | --- |
 | `ringFileCreate`, `ringFileOpen`, `ringFileClose` | Create an empty file exclusively. Open an existing file in read-only or read-write mode. Report failures without silently recreating or truncating the data. |
-| `ringFileAdd` | Extract the key from the input struct. Reject a duplicate active key without changing any records. Append a new key as newest and, at capacity, evict exactly the oldest record. A previously evicted key may be reused. |
-| `ringFileReadByKey` | Copy the matching record into the caller's output struct. |
-| `ringFileUpdateByKey` | Replace the complete record for an existing key while preserving its insertion position. Reject a replacement whose embedded key differs from the lookup key. |
-| `ringFileReadOldest`, `ringFileReadNewest` | Copy the first or last record in insertion order into the caller's output struct. |
-| `ringFileIteratorBegin`, `ringFileIteratorNext`, `ringFileIteratorPrevious` | Start at the oldest or newest record or at an exact key. Traverse in either direction and copy each record into a caller-owned struct. Stop at the logical ends. Give each caller its own cursor. A successful mutation invalidates existing cursors on that handle. |
-| `ringFileResize` | Increase or decrease capacity while preserving the relative order of retained records. On shrink, retain the newest records that fit. Support capacity one and reject zero. Persist the new capacity. |
-| `ringFileGetInfo` | Report count, capacity, record size, schema version and storage size. |
+| `ringFileAdd` | Takes the timestamp and the payload record. The component validates the timestamp digits, stores the full timestamp as field 1 and the derived `usedKey` as field 2, and computes the bucketId. Adding the `usedKey` of an active record updates that record in place; otherwise append as newest and, at capacity, evict exactly the oldest record. Reject a timestamp whose bucket is older than the newest stored bucket (clock rewind or gap fill) without changing any records; `ringFileEdit` covers backfill. |
+| `ringFileReadByKey` | Copy the full stored record (timestamp, usedKey, payload) of the matching `usedKey` into the caller's output buffer. |
+| `ringFileUpdateByKey` | Takes the lookup `usedKey`, the new timestamp and the payload. Replace the complete record for an existing `usedKey` while preserving its bucket position. Reject a replacement whose timestamp derives a different `usedKey` than the lookup key. |
+| `ringFileReadOldest`, `ringFileReadNewest` | Copy the first or last record in bucket order (timestamp, usedKey, payload) into the caller's output buffer. |
+| `ringFileIteratorBegin`, `ringFileIteratorNext`, `ringFileIteratorPrevious` | Start at the oldest or newest bucket or at an exact `usedKey`. Traverse in either direction and copy each full record into a caller-owned buffer. Stop at the logical ends. Give each caller its own cursor. Report the bucketId (`period % capacity`) per returned record. A successful mutation invalidates existing cursors on that handle. |
+| `ringFileResize` | Increase or decrease capacity while preserving the relative order of retained records. On shrink, retain the newest buckets that fit. Support capacity one and reject zero. Persist the new capacity. |
+| `ringFileGetInfo` | Report count, capacity, payload size, stored record size, `schemaId` string, granularity and storage size. |
 | `ringFileSync` | Commit pending buffered changes and synchronize through the backend. Clean handles perform no write or sync. Report failures and document backend guarantees. |
 | `ringFileValidate` | Provide a read-only integrity check with a result that identifies bad metadata or records. |
-| `ringFileClear` | Explicitly discard all records while retaining schema and capacity. Apply the same commit and recovery rules as for other mutations. |
+| `ringFileClear` | Explicitly discard all records while retaining the file type and capacity. Apply the same commit and recovery rules as for other mutations. |
 
-“Oldest” and “newest” refer to insertion order. Keys may arrive out of order, and gaps between numeric keys consume zero slots. A full ring holding keys 100, 300 and 200 in that order must hold 300, 200 and 50 after adding key 50. Updating 200 preserves its position. Shrinking that ring to two records retains 200 and 50.
+"Oldest" and "newest" refer to bucket (period) order. Adding records
+out of chronological order is only allowed through `ringFileEdit` within the
+retained window `[newestPeriod - capacity + 1, newestPeriod]`. A full ring
+holding the ten hourly buckets 08:00–17:00 must evict 08:00 when 18:00 is
+added. Updating an active bucket preserves its position. Shrinking that ring
+to two records retains 16:00 and 17:00.
 
 Document a practical update-or-add pattern for a logger that revises the current hourly record. If a combined function is implemented, hold the lock throughout lookup and mutation and preserve the position of an existing record.
 
@@ -50,7 +103,7 @@ Document a practical update-or-add pattern for a logger that revises the current
 ## Storage wear and durability policy
 
 - Minimize both write frequency and write amplification, including transaction metadata. Regular adds and edits must never rewrite the entire ring or rewrite a fixed header or fixed journal location on every commit. Distribute commit records across a bounded set of reusable locations or derive committed state from rotating slot metadata. Apply this to repeated edits of the same key, including a single-record ring. Preserve recoverability when those locations wrap. Document extra storage, cleanup frequency and write cost, including any filesystem-level copying observed on LittleFS.
-- Skip writes for unchanged records. Use the defined key equivalence and initialized payload bytes when deciding whether a replacement is identical. Reads, validation and clean close must never generate component-level writes. Writable open may perform recovery when required.
+- Skip writes for unchanged records. Use the defined key equality and initialized payload bytes when deciding whether a replacement is identical. Reads, validation and clean close must never generate component-level writes. Writable open may perform recovery when required.
 - Offer two explicit persistence modes. In immediate mode, the default, a successful mutation is committed and synchronized through the backend. In opt-in buffered mode, stage changes in a bounded RAM buffer, coalesce repeated updates to the same active record where that preserves observable semantics, and commit when the configured buffer limit is reached, on explicit sync or on successful close. Reads on the handle see staged changes. Preserve insertion, eviction and key uniqueness semantics even before a flush. Define limits and the handling of resize and clear with pending data. Document the maximum number of pending mutations and that their age is unbounded unless the application schedules periodic syncs. Buffered success acknowledges a staged operation. A power cut may lose the unsynchronized changes. Preserve a recoverable committed state under either mode within the stated backend guarantees.
 - Keep LittleFS wear leveling enabled and document the tested partition and free-space assumptions. On SD with FATFS, limit host writes and unnecessary filesystem syncs. Verify whether the selected FATFS settings add implicit syncs and account for them. Physical wear leveling on SD is managed by the card and may be unobservable.
 - Show a logging example that accumulates the current hourly meter record in RAM and commits at the hourly boundary, with optional periodic syncs if interim recovery is required. Demonstrate how to stage equivalent updates through the buffered API and document the power-loss window for each example.
@@ -69,7 +122,20 @@ text with a short description specific to that file.
 //--
 //-- ringFileStore - <brief description of what this file does>
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
+//-- SPDX-License-Identifier: GPL-3.0-or-later
 //--
+```
+
+Use HTML-Comment block for all .md files
+
+```text
+<!--
+ FileVersion: [<nr>] <date/time>
+
+ ringFileStore - <brief description of what this file does>
+ Copyright (C) 2026 Willem Aandewiel (mrWheel)
+ SPDX-License-Identifier: GPL-3.0-or-later
+-->
 ```
 
 `<nr>` must be incremented at every change of this file. `<date/time>` as "DD-MM-EEYY - HH:MM"
@@ -77,9 +143,12 @@ text with a short description specific to that file.
 ## Deliverables and verification
 
 1. Supply a drop-in `components/ring_file_store/` directory with source, public header and `CMakeLists.txt`. Include dependency metadata wherever an example needs a managed component.
-2. Provide a README with the API and error table, binary format, transaction and recovery rules, storage and RAM estimates, and build instructions.
-3. Provide an ESP32-S3 example that runs the same ring operations with LittleFS or an SD card. Use a sample meter record with a `uint64_t` timestamp key. Demonstrate create, reopen, wraparound, lookup, edit, iteration in both directions and resize.
-4. Add automated tests for empty and single-slot rings, duplicates, key comparison, out-of-order insertion, wraparound, updates, iterator invalidation, schema mismatch, reopen, corruption, resizing after wraparound and insufficient space. Inject failures around each mutation's write, sync and rename boundaries and check the resulting state after reopening. Check that a recoverable interruption exposes a complete previous or new state.
+2. Provide a README with the API and error table, the timestamp key model
+   (file types, stored record prefix, `usedKey` and bucketId formulas), binary
+   format, transaction and recovery rules, storage and RAM estimates, and
+   build instructions.
+3. Provide an ESP32-S3 example that runs the same ring operations with LittleFS or an SD card. Use a sample meter payload record and numeric `EEYYMMDDhhmmss` timestamps, and demonstrate at least an hourly (`"YYMMDDhh"`) and a monthly (`"YYMM"`) file type. Demonstrate create, reopen, wraparound, lookup by `usedKey`, edit/backfill, iteration in both directions and resize.
+4. Add automated tests for empty and single-slot rings, same-bucket overwrite, `usedKey` and bucketId calculation for every file type, out-of-order backfill inside and outside the retained window, updates, iterator invalidation, file type mismatch, reopen, corruption, resizing after wraparound and insufficient space. Inject failures around each mutation's write, sync and rename boundaries and check the resulting state after reopening. Check that a recoverable interruption exposes a complete previous or new state.
 5. Build the examples with ESP-IDF 6.0.2. Report the commands and observed results, identifying which tests were executed with simulated failures and which storage backends were tested on hardware.
 6. After the first successful call to `ringFileCreate()` or `ringFileOpen()`
    after boot, log the following notice using one `ESP_LOGI()` call per line
@@ -94,6 +163,7 @@ text with a short description specific to that file.
    ```
 
 ## Coding and documentation rules
+ * All comments, messages and documentation in English
  * Use Allman brace style.
  * Use two spaces for indentation.
  * Use lowerCamelCase for functions and variables, except in strict component code where PascalCase naming is used.

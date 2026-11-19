@@ -275,3 +275,36 @@ English.
   ring files section, format table v3), test README coverage bullets;
   main.c demoTimeStampRing() added. Boot-notice deliverable
   (projectPrompt item 6) remains open from earlier sessions.
+
+## 19-11-2026 (continued)
+
+- 12:35 — Completed the timestamp-key rewrite (docs first, then code, this
+  log last). Model: every stored record is
+  `[u64 timeStamp][u64 usedKey][caller payload]`; config.recordSize is the
+  payload only, both key fields are always auto-added on write and always
+  returned on read. Timestamps are numeric EEYYMMDDhhmmss (century "20");
+  the file type string ("YY".."YYMMDDhhmmss") selects the usedKey
+  truncation (truncate = pad) and the bucketId source; sub-type digits
+  back-fill with "00". bucketId = period % capacity with YEAR=year,
+  MONTH=(year-1)*12+month (DSMRlogger32), DAY=days-since-epoch,
+  HOUR/MINUTE/SECOND extensions; eviction, iterators, edit window and
+  resize retention follow the period. Removed u32 schemaId/schemaVersion,
+  addressing modes, keyOffset/keyType/keySize/keyPositionMask and
+  timestampOffset; header format v4 (schemaId string + granularity, CRC
+  over [0,88)). Open validates expectedSchemaId + expectedRecordSize.
+  Boot notice (4 lines, tag "ringFileStore") logged once per boot after
+  first create/open (projectPrompt item 6). Crash-safe
+  commit/resize/lock protocol unchanged. Core rewrite in
+  src/ring_file_store.c + rfs_time.c/.h; host suite rewritten to 28 tests
+  / 594 checks / 0 failures (independent reference periods: 20775,
+  498614, 29916870, 1795012255, 24310, 946684800), testLog.md
+  regenerated. Example app main.c [11] rewritten: payload-only structs,
+  full-record read structs with ringFileKeyFields_t prefix, hourly
+  "YYMMDDhh" operations/logger/buffered/resize/validate demos, new
+  "YYMM" monthly demo (replaces key mask) and "YYMMDDhhmmss" per-second
+  demo (replaces timestamp demo), dumps show ts + usedKey + bucketId.
+  Docs: projectPrompt [2], root README [3], component README [2], test
+  README [2]. idf.py build (esp32s3) clean, 0x3c190 bytes. Not flashed
+  (developer handles uploads).
+
+  Open: none.

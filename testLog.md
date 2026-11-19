@@ -1,363 +1,429 @@
 # ringFileStore — test log (host suite)
 
-Generated: 19-11-2026 - 10:01 — host tests with POSIX shims and failure-injection.
+Generated: 19-11-2026 - 12:35 — host tests with POSIX shims and failure-injection.
 
-Per line: **Command** (with data) and its **Result**; ring dumps show the key and the physical slot number per record.
+Every stored record carries the automatic key fields timeStamp and usedKey; ring dumps show both plus the reported bucketId (period % capacity).
 
 | Test | checks | failures |
 | --- | ---: | ---: |
 
 ## Test: arguments
-- **Test result:** 12 checks, 0 new failures
-| arguments | 12 | 0 |
+- **Test result:** 31 checks, 0 new failures
+| arguments | 31 | 0 |
 
 ## Test: createOpenReopen
-- **Test result:** 6 checks, 0 new failures
-| createOpenReopen | 6 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=100)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=101)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=102)
+  **Result:** ESP_OK
+- **Command:** ring dump after "add hh0..hh2" (count=3 capacity=4, oldest → newest)
+  - bucketId 0 ts=20261023000000 usedKey=2026102300 energyWh=100 errorCount=0
+  - bucketId 1 ts=20261023010000 usedKey=2026102301 energyWh=101 errorCount=1
+  - bucketId 2 ts=20261023020000 usedKey=2026102302 energyWh=102 errorCount=2
+- **Test result:** 25 checks, 0 new failures
+| createOpenReopen | 25 | 0 |
 
 ## Test: emptyRing
-- **Test result:** 6 checks, 0 new failures
-| emptyRing | 6 | 0 |
+- **Test result:** 7 checks, 0 new failures
+| emptyRing | 7 | 0 |
 
 ## Test: singleSlotRing
-- **Test result:** 114 checks, 0 new failures
-| singleSlotRing | 114 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=20)
+  **Result:** ESP_OK
+- **Test result:** 12 checks, 0 new failures
+| singleSlotRing | 12 | 0 |
 
-## Test: duplicatesAndWraparound
-- **Test result:** 20 checks, 0 new failures
-| duplicatesAndWraparound | 20 | 0 |
+## Test: sameBucketUpdate
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=100)
+  **Result:** ESP_OK
+- **Command:** ring dump after "add hh1" (count=1 capacity=3, oldest → newest)
+  - bucketId 1 ts=20261023010000 usedKey=2026102301 energyWh=100 errorCount=1
+- **Command:** ring dump after "upsert hh1:30" (count=1 capacity=3, oldest → newest)
+  - bucketId 1 ts=20261023013000 usedKey=2026102301 energyWh=150 errorCount=3
+- **Test result:** 8 checks, 0 new failures
+| sameBucketUpdate | 8 | 0 |
 
-## Test: updateSemantics
+## Test: notNewer
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=20)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=30)
+  **Result:** ESP_OK
+- **Command:** ring dump after "add hh0..hh2 (capacity 2, hh0 evicted)" (count=2 capacity=2, oldest → newest)
+  - bucketId 1 ts=20261023010000 usedKey=2026102301 energyWh=20 errorCount=1
+  - bucketId 0 ts=20261023020000 usedKey=2026102302 energyWh=30 errorCount=2
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=99)
+  **Result:** UNKNOWN
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=25)
+  **Result:** ESP_OK
+- **Test result:** 9 checks, 0 new failures
+| notNewer | 9 | 0 |
+
+## Test: timestampValidation
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=7)
+  **Result:** ESP_OK
+- **Test result:** 12 checks, 0 new failures
+| timestampValidation | 12 | 0 |
+
+## Test: bucketAndKeyDerivation
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=100)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=101)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=102)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023030000 usedKey=2026102303 energyWh=103)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023040000 usedKey=2026102304 energyWh=104)
+  **Result:** ESP_OK
+- **Command:** ring dump after "add hh0..hh4 (capacity 5)" (count=5 capacity=5, oldest → newest)
+  - bucketId 1 ts=20261023000000 usedKey=2026102300 energyWh=100 errorCount=0
+  - bucketId 2 ts=20261023010000 usedKey=2026102301 energyWh=101 errorCount=1
+  - bucketId 3 ts=20261023020000 usedKey=2026102302 energyWh=102 errorCount=2
+  - bucketId 4 ts=20261023030000 usedKey=2026102303 energyWh=103 errorCount=3
+  - bucketId 0 ts=20261023040000 usedKey=2026102304 energyWh=104 errorCount=4
+- **Command:** ringFileAdd(months 202610, 202611)
+  **Result:** ESP_OK
+- **Test result:** 75 checks, 0 new failures
+| bucketAndKeyDerivation | 75 | 0 |
+
+## Test: evictionOrder
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=0)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=20)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023030000 usedKey=2026102303 energyWh=30)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023040000 usedKey=2026102304 energyWh=40)
+  **Result:** ESP_OK
+- **Command:** ring dump after "add hh0..hh4 (capacity 3)" (count=3 capacity=3, oldest → newest)
+  - bucketId 2 ts=20261023020000 usedKey=2026102302 energyWh=20 errorCount=2
+  - bucketId 0 ts=20261023030000 usedKey=2026102303 energyWh=30 errorCount=3
+  - bucketId 1 ts=20261023040000 usedKey=2026102304 energyWh=40 errorCount=4
 - **Test result:** 13 checks, 0 new failures
-| updateSemantics | 13 | 0 |
+| evictionOrder | 13 | 0 |
 
-## Test: keyTypes
-- **Test result:** 58 checks, 0 new failures
-| keyTypes | 58 | 0 |
+## Test: editWindow
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Command:** ring dump after "edit hh5 insert (evicts hh0)" (count=3 capacity=3, oldest → newest)
+  - bucketId 1 ts=20261023010000 usedKey=2026102301 energyWh=11 errorCount=1
+  - bucketId 2 ts=20261023024500 usedKey=2026102302 energyWh=77 errorCount=0
+  - bucketId 2 ts=20261023050000 usedKey=2026102305 energyWh=55 errorCount=0
+- **Test result:** 14 checks, 0 new failures
+| editWindow | 14 | 0 |
+
+## Test: updateByKeyRules
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=100)
+  **Result:** ESP_OK
+- **Test result:** 11 checks, 0 new failures
+| updateByKeyRules | 11 | 0 |
 
 ## Test: iterator
-- **Test result:** 39 checks, 0 new failures
-| iterator | 39 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023030000 usedKey=2026102303 energyWh=13)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023040000 usedKey=2026102304 energyWh=14)
+  **Result:** ESP_OK
+- **Test result:** 36 checks, 0 new failures
+| iterator | 36 | 0 |
 
 ## Test: schemaMismatch
-- **Test result:** 5 checks, 0 new failures
-| schemaMismatch | 5 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Test result:** 6 checks, 0 new failures
+| schemaMismatch | 6 | 0 |
 
 ## Test: readOnly
-- **Test result:** 16 checks, 0 new failures
-| readOnly | 16 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Test result:** 10 checks, 0 new failures
+| readOnly | 10 | 0 |
 
 ## Test: staleLockBreak
-- **Test result:** 8 checks, 0 new failures
-| staleLockBreak | 8 | 0 |
+- **Test result:** 5 checks, 0 new failures
+| staleLockBreak | 5 | 0 |
 
 ## Test: corruption
-- **Test result:** 26 checks, 0 new failures
-| corruption | 26 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Test result:** 18 checks, 0 new failures
+| corruption | 18 | 0 |
 
 ## Test: clear
-- **Test result:** 16 checks, 0 new failures
-| clear | 16 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023070000 usedKey=2026102307 energyWh=70)
+  **Result:** ESP_OK
+- **Test result:** 11 checks, 0 new failures
+| clear | 11 | 0 |
 
 ## Test: resize
-- **Test result:** 32 checks, 0 new failures
-| resize | 32 | 0 |
-
-## Test: resizeEmptyAndErrors
-- **Test result:** 10 checks, 0 new failures
-| resizeEmptyAndErrors | 10 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=0)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=20)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023030000 usedKey=2026102303 energyWh=30)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023040000 usedKey=2026102304 energyWh=40)
+  **Result:** ESP_OK
+- **Command:** ring dump after "resize 5 -> 3" (count=3 capacity=3, oldest → newest)
+  - bucketId 2 ts=20261023020000 usedKey=2026102302 energyWh=20 errorCount=2
+  - bucketId 0 ts=20261023030000 usedKey=2026102303 energyWh=30 errorCount=3
+  - bucketId 1 ts=20261023040000 usedKey=2026102304 energyWh=40 errorCount=4
+- **Command:** ringFileAdd(ts=20261023050000 usedKey=2026102305 energyWh=50)
+  **Result:** ESP_OK
+- **Test result:** 25 checks, 0 new failures
+| resize | 25 | 0 |
 
 ## Test: resizeInterruptedStates
-- **Test result:** 21 checks, 0 new failures
-| resizeInterruptedStates | 21 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Command:** resize 5->3 with injected failure (scenario 0)
+  **Result:** rejected
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Command:** resize 5->3 with injected failure (scenario 1)
+  **Result:** rejected
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Command:** resize 5->3 with injected failure (scenario 2)
+  **Result:** rejected
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Command:** resize 5->3 with injected failure (scenario 3)
+  **Result:** rejected
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Command:** resize 5->3 with injected failure (scenario 4)
+  **Result:** rejected
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Test result:** 39 checks, 0 new failures
+| resizeInterruptedStates | 39 | 0 |
 
 ## Test: failureInjectionMutations
-- **Test result:** 15 checks, 0 new failures
-| failureInjectionMutations | 15 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=20)
+  **Result:** RING_FILE_STORE_ERR_IO
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=20)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=30)
+  **Result:** ESP_OK
+- **Test result:** 11 checks, 0 new failures
+| failureInjectionMutations | 11 | 0 |
 
 ## Test: unchangedWrites
-- **Test result:** 13 checks, 0 new failures
-| unchangedWrites | 13 | 0 |
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=100)
+  **Result:** ESP_OK
+- **Test result:** 9 checks, 0 new failures
+| unchangedWrites | 9 | 0 |
 
 ## Test: wearDistribution
-- **Test result:** 75 checks, 0 new failures
-| wearDistribution | 75 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=0)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=20)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023030000 usedKey=2026102303 energyWh=30)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023040000 usedKey=2026102304 energyWh=40)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023050000 usedKey=2026102305 energyWh=50)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023060000 usedKey=2026102306 energyWh=60)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023070000 usedKey=2026102307 energyWh=70)
+  **Result:** ESP_OK
+- **Test result:** 14 checks, 0 new failures
+| wearDistribution | 14 | 0 |
 
 ## Test: bufferedMode
-- **Test result:** 40 checks, 0 new failures
-| bufferedMode | 40 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=20)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=30)
+  **Result:** ESP_OK
+- **Command:** ring dump after "buffered 3 staged" (count=3 capacity=4, oldest → newest)
+  - slot **staged** (not yet on storage) ts=20261023000000 usedKey=2026102300 energyWh=10 errorCount=0
+  - slot **staged** (not yet on storage) ts=20261023010000 usedKey=2026102301 energyWh=20 errorCount=1
+  - slot **staged** (not yet on storage) ts=20261023020000 usedKey=2026102302 energyWh=30 errorCount=2
+- **Test result:** 22 checks, 0 new failures
+| bufferedMode | 22 | 0 |
 
 ## Test: bufferedOverflowFlushes
-- **Test result:** 10 checks, 0 new failures
-| bufferedOverflowFlushes | 10 | 0 |
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=20)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=30)
+  **Result:** ESP_OK
+- **Test result:** 7 checks, 0 new failures
+| bufferedOverflowFlushes | 7 | 0 |
 
-## Test: multipleFiles
-- **Test result:** 6 checks, 0 new failures
-| multipleFiles | 6 | 0 |
-
-## Test: validateGoodRing
-- **Test result:** 12 checks, 0 new failures
-| validateGoodRing | 12 | 0 |
-
-## Test: moreRecords
-- **Command:** ringFileAdd(key=100, energyWh=10, errorCount=1) on a capacity-10 ring
+## Test: multipleTypes
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=100)
   **Result:** ESP_OK
-- **Command:** ring dump after "add key=100" (count=1 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-- **Command:** ringFileAdd(key=200, energyWh=20, errorCount=2) on a capacity-10 ring
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=101)
   **Result:** ESP_OK
-- **Command:** ring dump after "add key=200" (count=2 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-  - slot 1 key=200 energyWh=20 errorCount=2
-- **Command:** ringFileAdd(key=300, energyWh=30, errorCount=3) on a capacity-10 ring
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=102)
   **Result:** ESP_OK
-- **Command:** ring dump after "add key=300" (count=3 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-  - slot 1 key=200 energyWh=20 errorCount=2
-  - slot 2 key=300 energyWh=30 errorCount=3
-- **Command:** ringFileAdd(key=400, energyWh=40, errorCount=4) on a capacity-10 ring
+- **Command:** ringFileAdd(ts=20261023030000 usedKey=2026102303 energyWh=103)
   **Result:** ESP_OK
-- **Command:** ring dump after "add key=400" (count=4 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-  - slot 1 key=200 energyWh=20 errorCount=2
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-- **Command:** ringFileAdd(key=500, energyWh=50, errorCount=5) on a capacity-10 ring
-  **Result:** ESP_OK
-- **Command:** ring dump after "add key=500" (count=5 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-  - slot 1 key=200 energyWh=20 errorCount=2
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 4 key=500 energyWh=50 errorCount=5
-- **Command:** ringFileAdd(key=600, energyWh=60, errorCount=6) on a capacity-10 ring
-  **Result:** ESP_OK
-- **Command:** ring dump after "add key=600" (count=6 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-  - slot 1 key=200 energyWh=20 errorCount=2
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 4 key=500 energyWh=50 errorCount=5
-  - slot 5 key=600 energyWh=60 errorCount=6
-- **Command:** ringFileAdd(key=700, energyWh=70, errorCount=7) on a capacity-10 ring
-  **Result:** ESP_OK
-- **Command:** ring dump after "add key=700" (count=7 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-  - slot 1 key=200 energyWh=20 errorCount=2
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 4 key=500 energyWh=50 errorCount=5
-  - slot 5 key=600 energyWh=60 errorCount=6
-  - slot 6 key=700 energyWh=70 errorCount=7
-- **Command:** ringFileAdd(key=800, energyWh=80, errorCount=8) on a capacity-10 ring
-  **Result:** ESP_OK
-- **Command:** ring dump after "add key=800" (count=8 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-  - slot 1 key=200 energyWh=20 errorCount=2
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 4 key=500 energyWh=50 errorCount=5
-  - slot 5 key=600 energyWh=60 errorCount=6
-  - slot 6 key=700 energyWh=70 errorCount=7
-  - slot 7 key=800 energyWh=80 errorCount=8
-- **Command:** ringFileAdd(key=900, energyWh=90, errorCount=9) on a capacity-10 ring
-  **Result:** ESP_OK
-- **Command:** ring dump after "add key=900" (count=9 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-  - slot 1 key=200 energyWh=20 errorCount=2
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 4 key=500 energyWh=50 errorCount=5
-  - slot 5 key=600 energyWh=60 errorCount=6
-  - slot 6 key=700 energyWh=70 errorCount=7
-  - slot 7 key=800 energyWh=80 errorCount=8
-  - slot 8 key=900 energyWh=90 errorCount=9
-- **Command:** ringFileAdd(key=1000, energyWh=100, errorCount=10) on a capacity-10 ring
-  **Result:** ESP_OK
-- **Command:** ring dump after "add key=1000" (count=10 capacity=10, oldest → newest)
-  - slot 0 key=100 energyWh=10 errorCount=1
-  - slot 1 key=200 energyWh=20 errorCount=2
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 4 key=500 energyWh=50 errorCount=5
-  - slot 5 key=600 energyWh=60 errorCount=6
-  - slot 6 key=700 energyWh=70 errorCount=7
-  - slot 7 key=800 energyWh=80 errorCount=8
-  - slot 8 key=900 energyWh=90 errorCount=9
-  - slot 9 key=1000 energyWh=100 errorCount=10
-- **Command:** ringFileAdd(key=1100, energyWh=110, errorCount=11) on a capacity-10 ring
-  **Result:** ESP_OK
-- **Command:** ring dump after "add key=1100" (count=10 capacity=10, oldest → newest)
-  - slot 1 key=200 energyWh=20 errorCount=2
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 4 key=500 energyWh=50 errorCount=5
-  - slot 5 key=600 energyWh=60 errorCount=6
-  - slot 6 key=700 energyWh=70 errorCount=7
-  - slot 7 key=800 energyWh=80 errorCount=8
-  - slot 8 key=900 energyWh=90 errorCount=9
-  - slot 9 key=1000 energyWh=100 errorCount=10
-  - slot 10 key=1100 energyWh=110 errorCount=11
-- **Command:** ringFileAdd(key=1200, energyWh=120, errorCount=12) on a capacity-10 ring
-  **Result:** ESP_OK
-- **Command:** ring dump after "add key=1200" (count=10 capacity=10, oldest → newest)
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 4 key=500 energyWh=50 errorCount=5
-  - slot 5 key=600 energyWh=60 errorCount=6
-  - slot 6 key=700 energyWh=70 errorCount=7
-  - slot 7 key=800 energyWh=80 errorCount=8
-  - slot 8 key=900 energyWh=90 errorCount=9
-  - slot 9 key=1000 energyWh=100 errorCount=10
-  - slot 10 key=1100 energyWh=110 errorCount=11
-  - slot 0 key=1200 energyWh=120 errorCount=12
-- **Command:** ringFileReadByKey(key=100) — evicted by the 11th add
-  **Result:** RING_FILE_STORE_ERR_KEY_NOT_FOUND
-- **Command:** ringFileReadByKey(key=200) — evicted by the 12th add
-  **Result:** RING_FILE_STORE_ERR_KEY_NOT_FOUND
-- **Command:** ringFileReadByKey for all 10 active keys (300..1200)
-  **Result:** keys 300..1200 active, energyWh correct
-- **Command:** ringFileReadOldest()
-  **Result:** ESP_OK
-- **Command:** ringFileReadNewest()
-  **Result:** ESP_OK
-- **Command:** ringFileUpdateByKey(key=500, energyWh=999, errorCount=7) — position preserved
-  **Result:** ESP_OK
-- **Command:** ring dump after "update key=500" (count=10 capacity=10, oldest → newest)
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 1 key=500 energyWh=999 errorCount=7
-  - slot 5 key=600 energyWh=60 errorCount=6
-  - slot 6 key=700 energyWh=70 errorCount=7
-  - slot 7 key=800 energyWh=80 errorCount=8
-  - slot 8 key=900 energyWh=90 errorCount=9
-  - slot 9 key=1000 energyWh=100 errorCount=10
-  - slot 10 key=1100 energyWh=110 errorCount=11
-  - slot 0 key=1200 energyWh=120 errorCount=12
-- **Command:** ring dump after "reopen after close" (count=10 capacity=10, oldest → newest)
-  - slot 2 key=300 energyWh=30 errorCount=3
-  - slot 3 key=400 energyWh=40 errorCount=4
-  - slot 1 key=500 energyWh=999 errorCount=7
-  - slot 5 key=600 energyWh=60 errorCount=6
-  - slot 6 key=700 energyWh=70 errorCount=7
-  - slot 7 key=800 energyWh=80 errorCount=8
-  - slot 8 key=900 energyWh=90 errorCount=9
-  - slot 9 key=1000 energyWh=100 errorCount=10
-  - slot 10 key=1100 energyWh=110 errorCount=11
-  - slot 0 key=1200 energyWh=120 errorCount=12
-- **Test result:** 43 checks, 0 new failures
-| moreRecords | 43 | 0 |
-
-## Test: keyPositionMask
-- **Command:** ringFileCreate(capacity=4, key=timestamp u64, keyPositionMask=0x00000000000000fc: byte positions 0-1 not significant)
-  **Result:** ESP_OK
-- **Command:** ringFileAdd(key=0x0000000012340001)
-  **Result:** ESP_OK
-- **Command:** ringFileAdd(key=0x00000000123400ab: only bytes 0-1 differ)
-  **Result:** RING_FILE_STORE_ERR_DUPLICATE_KEY
-- **Command:** ringFileReadByKey(key=0x00000000123400ff) finds key=0x0000000012340001 (byte 0 ignored)
-  **Result:** ESP_OK
-- **Command:** ringFileReadByKey(key=0x0000000012350000): byte 2 (significant) differs
-  **Result:** RING_FILE_STORE_ERR_KEY_NOT_FOUND
-- **Command:** ringFileUpdateByKey(key=0x0000000012340002, embedded key 0x0000000012340003: only byte 0 differs): accepted
-  **Result:** ESP_OK
-- **Command:** ringFileReadByKey(key=0x0000000012340001) shows the update
-  **Result:** ESP_OK
-- **Command:** ring dump after "keymask scenario (adds, duplicate, update)" (count=1 capacity=4, oldest → newest)
-  - slot 1 key=305397763 energyWh=33 errorCount=1
-- **Command:** reopen: keyPositionMask from header, readByKey(0x00000000123400ff) finds the record
-  **Result:** ESP_OK
-- **Command:** ringFileCreate keyPositionMask=0x1FF (bit beyond keySize=8) -> rejected
-  **Result:** ESP_ERR_INVALID_ARG
-- **Command:** ringFileCreate BYTES keySize=80 with keyPositionMask (mask limited to positions 0-63) -> rejected
-  **Result:** ESP_ERR_INVALID_ARG
-- **Test result:** 17 checks, 0 new failures
-| keyPositionMask | 17 | 0 |
-
-## Test: timeHelpers
-- **Command:** ringFileTimeStampStringToUnix("20000101000000") = 946684800
-  **Result:** ESP_OK
-- **Command:** ringFileTimeStampStringToUnix("20240229000000") leap day = 1709164800
-  **Result:** ESP_OK
-- **Command:** "20261023123378": second 78 rejected
-  **Result:** ESP_ERR_INVALID_ARG
-- **Command:** "20230229000000": 2023 is not a leap year
-  **Result:** ESP_ERR_INVALID_ARG
-- **Command:** "21000101000000": century 21 rejected
-  **Result:** ESP_ERR_INVALID_ARG
-- **Command:** ringFileUnixToTimeStampString(946684799): before 2000 rejected
-  **Result:** ESP_ERR_INVALID_ARG
-- **Command:** round-trip unix -> "20261023123300"
-  **Result:** ESP_OK
-- **Command:** week buckets: Sunday 2026-01-04 -> 2922, Monday 2026-01-05 -> 2923 (Monday starts the bucket)
-  **Result:** ESP_OK
-- **Command:** month bucket 2026-10 = (2026-1)*12+10 = 24310
-  **Result:** ESP_OK
-- **Command:** ringFileUnixToIsoWeek(2025-12-29) = 2026-W01
-  **Result:** ESP_OK
-- **Test result:** 54 checks, 0 new failures
-| timeHelpers | 54 | 0 |
-
-## Test: timeBucketRing
-- **Command:** ringFileCreate(TIMEBUCKET, HOUR, capacity=3, timestampOffset=0)
-  **Result:** ESP_OK
-- **Command:** ringFileAdd(hour 10)
-  **Result:** ESP_OK
-- **Command:** ringFileAdd(hour 11)
-  **Result:** ESP_OK
-- **Command:** ringFileAdd(hour 10 again at 10:59:59): same bucket overwritten
-  **Result:** ESP_OK
-- **Command:** ringFileAdd(hour 09: not newer -> refused, nothing stored
-  **Result:** UNKNOWN
-- **Command:** ringFileUpsert(hour 10 at 10:00:00): active bucket updated with any timestamp
-  **Result:** ESP_OK
-- **Command:** ringFileUpsert(hour 09 as new bucket): not newer -> refused
-  **Result:** UNKNOWN
-- **Command:** ringFileEdit(hour 12): newer bucket appended
-  **Result:** ESP_OK
-- **Command:** ringFileEdit(hour 09): outside retained window -> rejected
-  **Result:** UNKNOWN
-- **Command:** ringFileEdit(hour 10): active bucket updated
-  **Result:** ESP_OK
-- **Command:** ringFileAdd(hour 13): oldest bucket (hour 10) evicted
-  **Result:** ESP_OK
-- **Command:** iterator: bucket order, logical slot = bucketId % capacity
-  **Result:** ESP_OK
-- **Command:** ringFileIteratorBegin(KEY, bucketId of hour 12)
-  **Result:** ESP_OK
-- **Command:** ring dump after "TIMEBUCKET scenario (adds, overwrite, edit, eviction)" (count=3 capacity=3, oldest → newest)
-  - slot 2 key=1792753200 energyWh=110 errorCount=0
-  - slot 0 key=1792756800 energyWh=120 errorCount=0
-  - slot 1 key=1792760400 energyWh=130 errorCount=0
-- **Command:** reopen expecting DAY granularity -> schema mismatch
-  **Result:** RING_FILE_STORE_ERR_SCHEMA_MISMATCH
-- **Command:** ringFileResize(2): newest buckets (12, 13) retained
-  **Result:** ESP_OK
-- **Command:** ringFileEdit on INSERTION ring -> INVALID_STATE
-  **Result:** ESP_ERR_INVALID_STATE
-- **Command:** create TIMEBUCKET with timestampOffset+8 > recordSize -> rejected
-  **Result:** ESP_ERR_INVALID_ARG
-- **Command:** create TIMEBUCKET with invalid granularity -> rejected
-  **Result:** ESP_ERR_INVALID_ARG
-- **Test result:** 79 checks, 0 new failures
-| timeBucketRing | 79 | 0 |
-
-## Test: timeBucketBufferedAndV2
-- **Command:** ringFileCreate(TIMEBUCKET, DAY, buffered maxPending=4)
-  **Result:** ESP_OK
-- **Command:** buffered: staged same-day overwrite visible, slot staged
-  **Result:** ESP_OK
-- **Command:** after sync: logical slot = bucketId % capacity = 0
-  **Result:** ESP_OK
-- **Command:** reopen buffered DAY ring: two committed day records
-  **Result:** ESP_OK
-- **Command:** header patched: formatVersion 3 -> 2, CRC recomputed
-  **Result:** patched
-- **Command:** v2 file: insertion semantics kept (out-of-order key accepted, oldest/newest by seq)
+- **Command:** ringFileAdd(ts=20261023040000 usedKey=2026102304 energyWh=104)
   **Result:** ESP_OK
 - **Test result:** 35 checks, 0 new failures
-| timeBucketBufferedAndV2 | 35 | 0 |
+| multipleTypes | 35 | 0 |
+
+## Test: validateGoodRing
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=10)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=12)
+  **Result:** ESP_OK
+- **Test result:** 18 checks, 0 new failures
+| validateGoodRing | 18 | 0 |
+
+## Test: manyRecords
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=1000)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=1001)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=1002)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023030000 usedKey=2026102303 energyWh=1003)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023040000 usedKey=2026102304 energyWh=1004)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023050000 usedKey=2026102305 energyWh=1005)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023060000 usedKey=2026102306 energyWh=1006)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023070000 usedKey=2026102307 energyWh=1007)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023080000 usedKey=2026102308 energyWh=1008)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023090000 usedKey=2026102309 energyWh=1009)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024000000 usedKey=2026102400 energyWh=1010)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024010000 usedKey=2026102401 energyWh=1011)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024020000 usedKey=2026102402 energyWh=1012)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024030000 usedKey=2026102403 energyWh=1013)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024040000 usedKey=2026102404 energyWh=1014)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024050000 usedKey=2026102405 energyWh=1015)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024060000 usedKey=2026102406 energyWh=1016)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024070000 usedKey=2026102407 energyWh=1017)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024080000 usedKey=2026102408 energyWh=1018)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024090000 usedKey=2026102409 energyWh=1019)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025000000 usedKey=2026102500 energyWh=1020)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025010000 usedKey=2026102501 energyWh=1021)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025020000 usedKey=2026102502 energyWh=1022)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025030000 usedKey=2026102503 energyWh=1023)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025040000 usedKey=2026102504 energyWh=1024)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025050000 usedKey=2026102505 energyWh=1025)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025060000 usedKey=2026102506 energyWh=1026)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025070000 usedKey=2026102507 energyWh=1027)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025080000 usedKey=2026102508 energyWh=1028)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025090000 usedKey=2026102509 energyWh=1029)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026000000 usedKey=2026102600 energyWh=1030)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026010000 usedKey=2026102601 energyWh=1031)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026020000 usedKey=2026102602 energyWh=1032)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026030000 usedKey=2026102603 energyWh=1033)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026040000 usedKey=2026102604 energyWh=1034)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026050000 usedKey=2026102605 energyWh=1035)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026060000 usedKey=2026102606 energyWh=1036)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026070000 usedKey=2026102607 energyWh=1037)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026080000 usedKey=2026102608 energyWh=1038)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026090000 usedKey=2026102609 energyWh=1039)
+  **Result:** ESP_OK
+- **Test result:** 79 checks, 0 new failures
+| manyRecords | 79 | 0 |
+
+## Test: timeHelpers
+- **Test result:** 32 checks, 0 new failures
+| timeHelpers | 32 | 0 |
 
 ## Summary
 
-**PASS**: 801 checks, 0 failures.
+**PASS**: 594 checks, 0 failures.
