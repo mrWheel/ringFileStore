@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [6] 19-11-2026 - 15:25
+//-- FileVersion: [7] 20-11-2026 - 22:20
 //--
 //-- ringFileStore - host-side automated tests for the ring_file_store
 //-- component.
@@ -2113,6 +2113,123 @@ static void testManyRecords(void)
   ringFileClose(h);
 }
 
+//-- The slot-directory cache: committed-state queries run from RAM after
+//-- one scan per disk epoch. Guards against a regression back to the
+//-- per-query full-slot rescans (which cost >10^4 reads at this size).
+static void testDirectoryCache(void)
+{
+  ringFileHandle_t *h = mustCreateMeter("cachedir", 16);
+
+  for (uint32_t d = 0; d < 4; d++)
+  {
+    for (uint32_t hh = 0; hh < 10; hh++)
+    {
+      CHECK_ERR(addHour(h, d, hh, 2000u + d * 10u + hh), ESP_OK);
+    }
+  }
+
+  CHECK(infoCount(h) == 16);
+
+  ringFileStoreResetIoStats();
+
+  meterFull_t full;
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(h, &it, RING_FILE_ITER_OLDEST, NULL, &full),
+            ESP_OK);
+
+  uint32_t seen = 1;
+
+  while (ringFileIteratorNext(h, &it, &full) == ESP_OK)
+  {
+    seen++;
+  }
+
+  CHECK(seen == 16);
+
+  rfsIoStats_t stats = lastStats();
+
+  //-- Directory build (2 reads x 17 slots) plus one record load per
+  //-- returned record (2 reads x 16) ≈ 66 reads. The uncached scan cost
+  //-- several thousand reads at this size.
+  CHECK(stats.reads > 0);
+  CHECK(stats.reads < 300);
+
+  ringFileStoreResetIoStats();
+
+  //-- A keyed read on the warm cache is a record load only.
+  uint64_t probeKey = hourKey(hourTs(3u, 9u));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadByKey(h, probeKey, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(3u, 9u));
+  stats = lastStats();
+  CHECK(stats.reads <= 4);
+
+  ringFileStoreResetIoStats();
+
+  //-- A write through the handle invalidates the cache: the next query
+  //-- rescans (>= 34 reads) and sees the new newest record.
+  CHECK_ERR(addHour(h, 3u, 10u, 2333u), ESP_OK);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(h, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(3u, 10u));
+  stats = lastStats();
+  CHECK(stats.reads >= 30);
+  CHECK(stats.reads < 300);
+  CHECK(infoCount(h) == 16);
+
+  ringFileClose(h);
+}
+
+//-- Cache semantics across handles: a handle serves queries from its own
+//-- cache and sees its own writes immediately; commits by another handle
+//-- become visible after ringFileCacheInvalidate().
+static void testCrossHandleCache(void)
+{
+  ringFileHandle_t *a = mustCreateMeter("cachestale", 4);
+  CHECK_ERR(addHour(a, 0u, 0u, 11u), ESP_OK);
+
+  ringFileHandle_t *b = mustOpenMeter("cachestale", true);
+  CHECK(infoCount(b) == 1);
+
+  meterFull_t full;
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(b, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(0u, 0u));
+
+  //-- Write through handle a: handle b keeps its cached view.
+  CHECK_ERR(addHour(a, 0u, 1u, 12u), ESP_OK);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(b, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(0u, 0u));
+
+  //-- a always sees its own commit.
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(a, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(0u, 1u));
+
+  //-- Explicit invalidation lets b observe the other handle's commit.
+  CHECK_ERR(ringFileCacheInvalidate(b), ESP_OK);
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileReadNewest(b, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(0u, 1u));
+
+  ringFileIterator_t it;
+  memset(&it, 0, sizeof(it));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorBegin(b, &it, RING_FILE_ITER_OLDEST, NULL, &full),
+            ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(0u, 0u));
+  memset(&full, 0, sizeof(full));
+  CHECK_ERR(ringFileIteratorNext(b, &it, &full), ESP_OK);
+  CHECK(full.keys.timeStamp == hourTs(0u, 1u));
+  CHECK(ringFileIteratorNext(b, &it, &full) == RING_FILE_STORE_ERR_ITER_END);
+
+  ringFileClose(b);
+  ringFileClose(a);
+}
+
 static void testTimeHelpers(void)
 {
   char text[15];
@@ -2223,6 +2340,8 @@ int main(int argc, char *argv[])
     {"multipleTypes", testMultipleTypes},
     {"validateGoodRing", testValidateGoodRing},
     {"manyRecords", testManyRecords},
+    {"directoryCache", testDirectoryCache},
+    {"crossHandleCache", testCrossHandleCache},
     {"timeHelpers", testTimeHelpers},
   };
 

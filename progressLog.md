@@ -1,5 +1,5 @@
 <!--
- FileVersion: [5] 19-11-2026 - 15:25
+ FileVersion: [6] 20-11-2026 - 22:20
 
  ringFileStore - progress log: what was tried per session and the result.
  Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -407,3 +407,30 @@ English.
   completed. A stray Finder copy managed_components/joltwallet__littlefs
   2 (which made idf.py refuse) was removed by the fullclean. Full device
   run: PASS (example finished), testLog.md refreshed. No open problems.
+
+## 20-11-2026
+
+- 22:20 — Performance fix for the integrator's report (lastDSMRlogger):
+  a full-ring listing of the 24-bucket month file took 136 s (~5.7 s per
+  record) and starved the task watchdog / httpd send (errno 11 EAGAIN).
+  Root cause: every committed-state test (rfsBestCopy, rfsRankGreater,
+  rfsFindNeighbor, count/select/maxOrder/kth-oldest) re-derived state
+  from flash per query — rfsRankGreater called rfsBestCopy per newer
+  slot → O(n²) slot inspects (2 flash reads each) per call, O(n³+) per
+  iterator step. Fix: per-handle slot-directory cache (rfsDirEntry_t:
+  slot, seq, rev, order, key per valid slot) built by one scan per disk
+  epoch; rfsWriteAt invalidates the cache and bumps diskEpoch, so a
+  handle always serves its own writes fresh; all membership/ranking/
+  neighbor selection runs from RAM. Public ringFileCacheInvalidate()
+  added for long-lived handles that must observe another handle's
+  commits (open/query/close readers never need it). Fallback to the old
+  uncached scans stays for allocation failure. Probe handle in
+  ringFileValidate now also frees the cache buffers. Files:
+  ring_file_store.c [7], ring_file_store.h [7] (+ declaration), component
+  README [5] (API row, commit-protocol and complexity sections),
+  idf_component.yml version 0.1.3. Host suite: two new tests
+  (directoryCache read-budget regression, crossHandleCache invalidate
+  semantics) — PASS 689 checks / 0 failures. idf.py build (esp32s3)
+  clean, 0x3c880 bytes. Not published, not flashed (developer handles
+  both). Open: none; integrator must bump the dependency to ^0.1.3 to
+  pick the fix up.

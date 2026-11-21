@@ -1,6 +1,6 @@
 # ringFileStore — test log (host suite)
 
-Generated: 19-11-2026 - 15:30 — host tests with POSIX shims and failure-injection.
+Generated: 20-11-2026 - 22:43 — host tests with POSIX shims and failure-injection.
 
 Every stored record carries the automatic key fields timeStamp and usedKey; ring dumps show both plus the reported bucketId (period % capacity).
 
@@ -420,10 +420,104 @@ Every stored record carries the automatic key fields timeStamp and usedKey; ring
 - **Test result:** 79 checks, 0 new failures
 | manyRecords | 79 | 0 |
 
+## Test: directoryCache
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=2000)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=2001)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023020000 usedKey=2026102302 energyWh=2002)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023030000 usedKey=2026102303 energyWh=2003)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023040000 usedKey=2026102304 energyWh=2004)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023050000 usedKey=2026102305 energyWh=2005)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023060000 usedKey=2026102306 energyWh=2006)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023070000 usedKey=2026102307 energyWh=2007)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023080000 usedKey=2026102308 energyWh=2008)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023090000 usedKey=2026102309 energyWh=2009)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024000000 usedKey=2026102400 energyWh=2010)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024010000 usedKey=2026102401 energyWh=2011)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024020000 usedKey=2026102402 energyWh=2012)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024030000 usedKey=2026102403 energyWh=2013)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024040000 usedKey=2026102404 energyWh=2014)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024050000 usedKey=2026102405 energyWh=2015)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024060000 usedKey=2026102406 energyWh=2016)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024070000 usedKey=2026102407 energyWh=2017)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024080000 usedKey=2026102408 energyWh=2018)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261024090000 usedKey=2026102409 energyWh=2019)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025000000 usedKey=2026102500 energyWh=2020)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025010000 usedKey=2026102501 energyWh=2021)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025020000 usedKey=2026102502 energyWh=2022)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025030000 usedKey=2026102503 energyWh=2023)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025040000 usedKey=2026102504 energyWh=2024)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025050000 usedKey=2026102505 energyWh=2025)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025060000 usedKey=2026102506 energyWh=2026)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025070000 usedKey=2026102507 energyWh=2027)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025080000 usedKey=2026102508 energyWh=2028)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261025090000 usedKey=2026102509 energyWh=2029)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026000000 usedKey=2026102600 energyWh=2030)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026010000 usedKey=2026102601 energyWh=2031)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026020000 usedKey=2026102602 energyWh=2032)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026030000 usedKey=2026102603 energyWh=2033)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026040000 usedKey=2026102604 energyWh=2034)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026050000 usedKey=2026102605 energyWh=2035)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026060000 usedKey=2026102606 energyWh=2036)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026070000 usedKey=2026102607 energyWh=2037)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026080000 usedKey=2026102608 energyWh=2038)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026090000 usedKey=2026102609 energyWh=2039)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261026100000 usedKey=2026102610 energyWh=2333)
+  **Result:** ESP_OK
+- **Test result:** 54 checks, 0 new failures
+| directoryCache | 54 | 0 |
+
+## Test: crossHandleCache
+- **Command:** ringFileAdd(ts=20261023000000 usedKey=2026102300 energyWh=11)
+  **Result:** ESP_OK
+- **Command:** ringFileAdd(ts=20261023010000 usedKey=2026102301 energyWh=12)
+  **Result:** ESP_OK
+- **Test result:** 17 checks, 0 new failures
+| crossHandleCache | 17 | 0 |
+
 ## Test: timeHelpers
 - **Test result:** 32 checks, 0 new failures
 | timeHelpers | 32 | 0 |
 
 ## Summary
 
-**PASS**: 618 checks, 0 failures.
+**PASS**: 689 checks, 0 failures.

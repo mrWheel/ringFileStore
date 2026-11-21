@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [6] 19-11-2026 - 15:25
+//-- FileVersion: [7] 20-11-2026 - 22:20
 //--
 //-- ringFileStore - main ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -268,6 +268,19 @@ typedef struct
   bool used;
 } rfsPendingEntry_t;
 
+//-- One cached valid-slot image for the derived-state directory. Key is
+//-- the 8-byte little-endian usedKey, order the period of the full
+//-- timestamp. Populated by rfsDirEnsure(), never read from flash again
+//-- until the next storage write invalidates the cache.
+typedef struct
+{
+  uint32_t slot;
+  uint64_t seq;
+  uint32_t rev;
+  uint64_t order;
+  uint8_t key[8];
+} rfsDirEntry_t;
+
 struct ringFileHandle_s
 {
   int fd;
@@ -314,6 +327,19 @@ struct ringFileHandle_s
   uint8_t *keyBufA;
   uint8_t *keyBufB;
   uint8_t *recBuf;
+
+  //-- Derived-state cache. One scan of every slot fills the directory
+  //-- (valid slots with key, seq, rev and period); every committed-state
+  //-- query answers from RAM until a storage write through this handle
+  //-- bumps diskEpoch. dirRecBuf receives the record images during the
+  //-- scan so the caller-visible slotBuf is never touched by a rebuild.
+  rfsDirEntry_t *dir;
+  uint32_t dirCount;
+  uint32_t dirSlots;    //-- allocated entries in dir
+  uint64_t dirEpoch;    //-- diskEpoch the directory was built for
+  bool dirReady;
+  uint64_t diskEpoch;
+  uint8_t *dirRecBuf;
 };
 
 typedef struct
@@ -407,6 +433,8 @@ static void rfsFreeHandleMembers(ringFileHandle_t *h)
   free(h->keyBufA);
   free(h->keyBufB);
   free(h->recBuf);
+  free(h->dir);
+  free(h->dirRecBuf);
 
   if (h->ownsLock && h->lock != NULL)
   {
@@ -480,6 +508,11 @@ static bool rfsReadAt(int fd, uint64_t offset, uint8_t *buf, size_t len, bool *o
 static esp_err_t rfsWriteAt(ringFileHandle_t *h, int fd, uint64_t offset,
                             const uint8_t *buf, size_t len)
 {
+  //-- Any attempted write may have reached storage: drop the cached
+  //-- directory so the next query rescans. A successful write also opens
+  //-- a new disk epoch.
+  h->dirReady = false;
+
   if (rfsIoLseek(fd, (off_t)offset, SEEK_SET) != (off_t)offset)
   {
     h->ioFaulted = true;
@@ -502,6 +535,7 @@ static esp_err_t rfsWriteAt(ringFileHandle_t *h, int fd, uint64_t offset,
     done += (size_t)n;
   }
 
+  h->diskEpoch++;
   return ESP_OK;
 }
 
@@ -732,6 +766,100 @@ static bool rfsMemberBetter(uint64_t seqA, uint32_t revA, uint64_t seqB, uint32_
   return (seqA > seqB) || (seqA == seqB && revA > revB);
 }
 
+//-- Ensure the per-handle slot directory is current for the present disk
+//-- epoch. One scan of every slot feeds all committed-state queries; any
+//-- storage write through this handle bumps diskEpoch and forces a
+//-- rebuild. Returns false when the directory cannot be allocated; the
+//-- callers then fall back to the uncached full-slot scan paths.
+static bool rfsDirEnsure(ringFileHandle_t *h)
+{
+  if (h->dirReady && h->dirEpoch == h->diskEpoch)
+  {
+    return true;
+  }
+
+  uint32_t slots = rfsSlotCount(h);
+
+  if (h->dir == NULL || h->dirRecBuf == NULL || h->dirSlots < slots)
+  {
+    free(h->dir);
+    free(h->dirRecBuf);
+    h->dir = (rfsDirEntry_t *)malloc(sizeof(rfsDirEntry_t) * slots);
+    h->dirRecBuf = (uint8_t *)malloc(h->recordSize);
+
+    if (h->dir == NULL || h->dirRecBuf == NULL)
+    {
+      free(h->dir);
+      free(h->dirRecBuf);
+      h->dir = NULL;
+      h->dirRecBuf = NULL;
+      h->dirSlots = 0;
+      h->dirCount = 0;
+      h->dirReady = false;
+      return false;
+    }
+
+    h->dirSlots = slots;
+  }
+
+  h->dirCount = 0;
+
+  for (uint32_t idx = 0; idx < slots; idx++)
+  {
+    rfsSlotHdr_t hdr;
+
+    if (!rfsSlotInspect(h, idx, &hdr, h->dirRecBuf, NULL))
+    {
+      continue;
+    }
+
+    rfsDirEntry_t *e = &h->dir[h->dirCount++];
+    e->slot = idx;
+    e->seq = hdr.seq;
+    e->rev = hdr.rev;
+    rfsExtractKey(h, h->dirRecBuf, e->key);
+    e->order = rfsOrderOfRecord(h, h->dirRecBuf);
+  }
+
+  h->dirEpoch = h->diskEpoch;
+  h->dirReady = true;
+  return true;
+}
+
+//-- True when no other directory entry and no staged entry of the same
+//-- key carries a higher (seq, rev) than the given entry.
+static bool rfsDirEntryIsBest(ringFileHandle_t *h, const rfsDirEntry_t *e)
+{
+  for (uint32_t i = 0; i < h->dirCount; i++)
+  {
+    const rfsDirEntry_t *o = &h->dir[i];
+
+    if (o != e && rfsKeyEqual(o->key, e->key) &&
+        rfsMemberBetter(o->seq, o->rev, e->seq, e->rev))
+    {
+      return false;
+    }
+  }
+
+  uint64_t eKey = rfsGetU64(e->key);
+
+  for (uint32_t p = 0; p < h->pendingCount; p++)
+  {
+    if (!h->pending[p].used)
+    {
+      continue;
+    }
+
+    if (rfsKeyOfRecord(h->pendingRecords + (size_t)p * h->recordSize) == eKey &&
+        rfsMemberBetter(h->pending[p].seq, h->pending[p].rev, e->seq, e->rev))
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 //-- Newest valid copy of a key across disk slots and staged entries. The
 //-- key is the 8-byte little-endian usedKey; out->order carries the period
 //-- behind that key.
@@ -747,29 +875,53 @@ static void rfsBestCopy(ringFileHandle_t *h, const uint8_t *key, rfsMember_t *ou
 
   uint32_t slots = rfsSlotCount(h);
 
-  for (uint32_t idx = 0; idx < slots; idx++)
+  if (rfsDirEnsure(h))
   {
-    rfsSlotHdr_t hdr;
-
-    if (!rfsSlotInspect(h, idx, &hdr, NULL, NULL))
+    for (uint32_t i = 0; i < h->dirCount; i++)
     {
-      continue;
+      const rfsDirEntry_t *e = &h->dir[i];
+
+      if (!rfsKeyEqual(e->key, key))
+      {
+        continue;
+      }
+
+      if (!out->found || rfsMemberBetter(e->seq, e->rev, out->seq, out->rev))
+      {
+        out->found = true;
+        out->seq = e->seq;
+        out->rev = e->rev;
+        out->slot = (int32_t)e->slot;
+        out->pending = false;
+      }
     }
-
-    rfsExtractKey(h, h->slotBuf, h->keyBufA);
-
-    if (!rfsKeyEqual(h->keyBufA, key))
+  }
+  else
+  {
+    for (uint32_t idx = 0; idx < slots; idx++)
     {
-      continue;
-    }
+      rfsSlotHdr_t hdr;
 
-    if (!out->found || rfsMemberBetter(hdr.seq, hdr.rev, out->seq, out->rev))
-    {
-      out->found = true;
-      out->seq = hdr.seq;
-      out->rev = hdr.rev;
-      out->slot = (int32_t)idx;
-      out->pending = false;
+      if (!rfsSlotInspect(h, idx, &hdr, NULL, NULL))
+      {
+        continue;
+      }
+
+      rfsExtractKey(h, h->slotBuf, h->keyBufA);
+
+      if (!rfsKeyEqual(h->keyBufA, key))
+      {
+        continue;
+      }
+
+      if (!out->found || rfsMemberBetter(hdr.seq, hdr.rev, out->seq, out->rev))
+      {
+        out->found = true;
+        out->seq = hdr.seq;
+        out->rev = hdr.rev;
+        out->slot = (int32_t)idx;
+        out->pending = false;
+      }
     }
   }
 
@@ -809,29 +961,49 @@ static uint32_t rfsRankGreater(ringFileHandle_t *h, uint64_t order)
   uint32_t rank = 0;
   uint32_t slots = rfsSlotCount(h);
 
-  for (uint32_t idx = 0; idx < slots; idx++)
+  if (rfsDirEnsure(h))
   {
-    rfsSlotHdr_t hdr;
-
-    if (!rfsSlotHeaderValid(h, idx, &hdr))
+    for (uint32_t i = 0; i < h->dirCount; i++)
     {
-      continue;
+      const rfsDirEntry_t *e = &h->dir[i];
+
+      if (e->order <= order)
+      {
+        continue;
+      }
+
+      if (rfsDirEntryIsBest(h, e))
+      {
+        rank++;
+      }
     }
-
-    rfsExtractKey(h, h->slotBuf, h->keyBufB);
-    uint64_t slotOrder = rfsOrderOfRecord(h, h->slotBuf);
-
-    if (slotOrder <= order)
+  }
+  else
+  {
+    for (uint32_t idx = 0; idx < slots; idx++)
     {
-      continue;
-    }
+      rfsSlotHdr_t hdr;
 
-    rfsMember_t best;
-    rfsBestCopy(h, h->keyBufB, &best);
+      if (!rfsSlotHeaderValid(h, idx, &hdr))
+      {
+        continue;
+      }
 
-    if (best.found && !best.pending && (uint32_t)best.slot == idx)
-    {
-      rank++;
+      rfsExtractKey(h, h->slotBuf, h->keyBufB);
+      uint64_t slotOrder = rfsOrderOfRecord(h, h->slotBuf);
+
+      if (slotOrder <= order)
+      {
+        continue;
+      }
+
+      rfsMember_t best;
+      rfsBestCopy(h, h->keyBufB, &best);
+
+      if (best.found && !best.pending && (uint32_t)best.slot == idx)
+      {
+        rank++;
+      }
     }
   }
 
@@ -911,23 +1083,36 @@ static uint32_t rfsCountActive(ringFileHandle_t *h)
   uint32_t distinct = 0;
   uint32_t slots = rfsSlotCount(h);
 
-  for (uint32_t idx = 0; idx < slots; idx++)
+  if (rfsDirEnsure(h))
   {
-    rfsSlotHdr_t hdr;
-
-    if (!rfsSlotHeaderValid(h, idx, &hdr))
+    for (uint32_t i = 0; i < h->dirCount; i++)
     {
-      continue;
+      if (rfsDirEntryIsBest(h, &h->dir[i]))
+      {
+        distinct++;
+      }
     }
-
-    rfsExtractKey(h, h->slotBuf, h->keyBufB);
-
-    rfsMember_t best;
-    rfsBestCopy(h, h->keyBufB, &best);
-
-    if (best.found && !best.pending && (uint32_t)best.slot == idx)
+  }
+  else
+  {
+    for (uint32_t idx = 0; idx < slots; idx++)
     {
-      distinct++;
+      rfsSlotHdr_t hdr;
+
+      if (!rfsSlotHeaderValid(h, idx, &hdr))
+      {
+        continue;
+      }
+
+      rfsExtractKey(h, h->slotBuf, h->keyBufB);
+
+      rfsMember_t best;
+      rfsBestCopy(h, h->keyBufB, &best);
+
+      if (best.found && !best.pending && (uint32_t)best.slot == idx)
+      {
+        distinct++;
+      }
     }
   }
 
@@ -949,6 +1134,44 @@ static uint32_t rfsCountActive(ringFileHandle_t *h)
 static esp_err_t rfsSelectFreeSlot(ringFileHandle_t *h, uint32_t *outIdx)
 {
   uint32_t slots = rfsSlotCount(h);
+
+  if (rfsDirEnsure(h))
+  {
+    for (uint32_t k = 0; k < slots; k++)
+    {
+      uint32_t idx = (h->nextSlotHint + k) % slots;
+      rfsDirEntry_t *entry = NULL;
+
+      for (uint32_t i = 0; i < h->dirCount; i++)
+      {
+        if (h->dir[i].slot == idx)
+        {
+          entry = &h->dir[i];
+          break;
+        }
+      }
+
+      //-- Slot absent from the directory: never used, corrupted or hidden
+      //-- by the epoch.
+      if (entry == NULL)
+      {
+        *outIdx = idx;
+        return ESP_OK;
+      }
+
+      bool isMember = rfsDirEntryIsBest(h, entry) &&
+                      rfsRankGreater(h, entry->order) < h->capacity;
+
+      if (!isMember)
+      {
+        *outIdx = idx;
+        return ESP_OK;
+      }
+    }
+
+    ESP_LOGE(TAG, "no free slot: invariant violation");
+    return ESP_ERR_INVALID_STATE;
+  }
 
   for (uint32_t k = 0; k < slots; k++)
   {
@@ -1545,23 +1768,48 @@ static esp_err_t rfsDeriveState(ringFileHandle_t *h)
     return err;
   }
 
+  //-- The geometry may have changed (resize): start from an empty cache.
+  free(h->dir);
+  h->dir = NULL;
+  free(h->dirRecBuf);
+  h->dirRecBuf = NULL;
+  h->dirCount = 0;
+  h->dirSlots = 0;
+  h->dirReady = false;
+  h->dirEpoch = 0;
+  h->diskEpoch = 0;
+
   uint64_t maxSeq = 0;
   bool any = false;
   uint32_t slots = rfsSlotCount(h);
 
-  for (uint32_t idx = 0; idx < slots; idx++)
+  if (rfsDirEnsure(h))
   {
-    rfsSlotHdr_t hdr;
-
-    if (!rfsSlotHeaderValid(h, idx, &hdr))
+    for (uint32_t i = 0; i < h->dirCount; i++)
     {
-      continue;
+      if (!any || h->dir[i].seq > maxSeq)
+      {
+        maxSeq = h->dir[i].seq;
+        any = true;
+      }
     }
-
-    if (!any || hdr.seq > maxSeq)
+  }
+  else
+  {
+    for (uint32_t idx = 0; idx < slots; idx++)
     {
-      maxSeq = hdr.seq;
-      any = true;
+      rfsSlotHdr_t hdr;
+
+      if (!rfsSlotHeaderValid(h, idx, &hdr))
+      {
+        continue;
+      }
+
+      if (!any || hdr.seq > maxSeq)
+      {
+        maxSeq = hdr.seq;
+        any = true;
+      }
     }
   }
 
@@ -2013,37 +2261,63 @@ static bool rfsMaxOrderLocked(ringFileHandle_t *h, uint64_t *outOrder)
   *outOrder = 0;
   uint32_t slots = rfsSlotCount(h);
 
-  for (uint32_t idx = 0; idx < slots; idx++)
+  if (rfsDirEnsure(h))
   {
-    rfsSlotHdr_t hdr;
-
-    if (!rfsSlotHeaderValid(h, idx, &hdr))
+    for (uint32_t i = 0; i < h->dirCount; i++)
     {
-      continue;
+      const rfsDirEntry_t *e = &h->dir[i];
+
+      if (!rfsDirEntryIsBest(h, e))
+      {
+        continue;
+      }
+
+      if (rfsRankGreater(h, e->order) >= h->capacity)
+      {
+        continue;
+      }
+
+      if (!found || e->order > *outOrder)
+      {
+        found = true;
+        *outOrder = e->order;
+      }
     }
-
-    //-- Derive key and period from the slot image before rfsBestCopy()
-    //-- reuses the scratch buffers.
-    rfsExtractKey(h, h->slotBuf, h->keyBufB);
-    uint64_t order = rfsOrderOfRecord(h, h->slotBuf);
-
-    rfsMember_t cand;
-    rfsBestCopy(h, h->keyBufB, &cand);
-
-    if (!cand.found || cand.pending || (uint32_t)cand.slot != idx)
+  }
+  else
+  {
+    for (uint32_t idx = 0; idx < slots; idx++)
     {
-      continue;
-    }
+      rfsSlotHdr_t hdr;
 
-    if (rfsRankGreater(h, order) >= h->capacity)
-    {
-      continue;
-    }
+      if (!rfsSlotHeaderValid(h, idx, &hdr))
+      {
+        continue;
+      }
 
-    if (!found || order > *outOrder)
-    {
-      found = true;
-      *outOrder = order;
+      //-- Derive key and period from the slot image before rfsBestCopy()
+      //-- reuses the scratch buffers.
+      rfsExtractKey(h, h->slotBuf, h->keyBufB);
+      uint64_t order = rfsOrderOfRecord(h, h->slotBuf);
+
+      rfsMember_t cand;
+      rfsBestCopy(h, h->keyBufB, &cand);
+
+      if (!cand.found || cand.pending || (uint32_t)cand.slot != idx)
+      {
+        continue;
+      }
+
+      if (rfsRankGreater(h, order) >= h->capacity)
+      {
+        continue;
+      }
+
+      if (!found || order > *outOrder)
+      {
+        found = true;
+        *outOrder = order;
+      }
     }
   }
 
@@ -2367,36 +2641,73 @@ static esp_err_t rfsReadEndLocked(ringFileHandle_t *handle, void *outRecord,
 
   uint32_t slots = rfsSlotCount(handle);
 
-  for (uint32_t idx = 0; idx < slots; idx++)
+  if (rfsDirEnsure(handle))
   {
-    rfsSlotHdr_t hdr;
-
-    if (!rfsSlotHeaderValid(handle, idx, &hdr))
+    for (uint32_t i = 0; i < handle->dirCount; i++)
     {
-      continue;
+      const rfsDirEntry_t *e = &handle->dir[i];
+      uint64_t order = e->order;
+
+      if (!rfsDirEntryIsBest(handle, e))
+      {
+        continue;
+      }
+
+      if (rfsRankGreater(handle, order) >= handle->capacity)
+      {
+        continue;
+      }
+
+      rfsMember_t cand;
+      memset(&cand, 0, sizeof(cand));
+      cand.found = true;
+      cand.seq = e->seq;
+      cand.rev = e->rev;
+      cand.slot = (int32_t)e->slot;
+      cand.pending = false;
+      cand.order = order;
+
+      if (!found || (oldest ? order < bestOrder : order > bestOrder))
+      {
+        found = true;
+        best = cand;
+        bestOrder = order;
+      }
     }
-
-    rfsExtractKey(handle, handle->slotBuf, handle->keyBufB);
-    uint64_t order = rfsOrderOfRecord(handle, handle->slotBuf);
-
-    rfsMember_t cand;
-    rfsBestCopy(handle, handle->keyBufB, &cand);
-
-    if (!cand.found || cand.pending || (uint32_t)cand.slot != idx)
+  }
+  else
+  {
+    for (uint32_t idx = 0; idx < slots; idx++)
     {
-      continue;
-    }
+      rfsSlotHdr_t hdr;
 
-    if (rfsRankGreater(handle, order) >= handle->capacity)
-    {
-      continue;
-    }
+      if (!rfsSlotHeaderValid(handle, idx, &hdr))
+      {
+        continue;
+      }
 
-    if (!found || (oldest ? order < bestOrder : order > bestOrder))
-    {
-      found = true;
-      best = cand;
-      bestOrder = order;
+      rfsExtractKey(handle, handle->slotBuf, handle->keyBufB);
+      uint64_t order = rfsOrderOfRecord(handle, handle->slotBuf);
+
+      rfsMember_t cand;
+      rfsBestCopy(handle, handle->keyBufB, &cand);
+
+      if (!cand.found || cand.pending || (uint32_t)cand.slot != idx)
+      {
+        continue;
+      }
+
+      if (rfsRankGreater(handle, order) >= handle->capacity)
+      {
+        continue;
+      }
+
+      if (!found || (oldest ? order < bestOrder : order > bestOrder))
+      {
+        found = true;
+        best = cand;
+        bestOrder = order;
+      }
     }
   }
 
@@ -2476,52 +2787,104 @@ static bool rfsFindNeighbor(ringFileHandle_t *handle, uint64_t cursor, bool dirN
   uint64_t outOrder = 0;
   uint32_t slots = rfsSlotCount(handle);
 
-  for (uint32_t idx = 0; idx < slots; idx++)
+  if (rfsDirEnsure(handle))
   {
-    rfsSlotHdr_t hdr;
-
-    if (!rfsSlotHeaderValid(handle, idx, &hdr))
+    for (uint32_t i = 0; i < handle->dirCount; i++)
     {
-      continue;
+      const rfsDirEntry_t *e = &handle->dir[i];
+      uint64_t order = e->order;
+      bool passes;
+
+      if (dirNext)
+      {
+        passes = inclusive ? (order >= cursor) : (order > cursor);
+      }
+      else
+      {
+        passes = (order < cursor);
+      }
+
+      if (!passes)
+      {
+        continue;
+      }
+
+      if (!rfsDirEntryIsBest(handle, e))
+      {
+        continue;
+      }
+
+      if (rfsRankGreater(handle, order) >= handle->capacity)
+      {
+        continue;
+      }
+
+      rfsMember_t cand;
+      memset(&cand, 0, sizeof(cand));
+      cand.found = true;
+      cand.seq = e->seq;
+      cand.rev = e->rev;
+      cand.slot = (int32_t)e->slot;
+      cand.pending = false;
+      cand.order = order;
+
+      if (!found || (dirNext ? order < outOrder : order > outOrder))
+      {
+        found = true;
+        *out = cand;
+        outOrder = order;
+      }
     }
-
-    rfsExtractKey(handle, handle->slotBuf, handle->keyBufB);
-    uint64_t order = rfsOrderOfRecord(handle, handle->slotBuf);
-
-    bool passes;
-
-    if (dirNext)
+  }
+  else
+  {
+    for (uint32_t idx = 0; idx < slots; idx++)
     {
-      passes = inclusive ? (order >= cursor) : (order > cursor);
-    }
-    else
-    {
-      passes = (order < cursor);
-    }
+      rfsSlotHdr_t hdr;
 
-    if (!passes)
-    {
-      continue;
-    }
+      if (!rfsSlotHeaderValid(handle, idx, &hdr))
+      {
+        continue;
+      }
 
-    rfsMember_t cand;
-    rfsBestCopy(handle, handle->keyBufB, &cand);
+      rfsExtractKey(handle, handle->slotBuf, handle->keyBufB);
+      uint64_t order = rfsOrderOfRecord(handle, handle->slotBuf);
 
-    if (!cand.found || cand.pending || (uint32_t)cand.slot != idx)
-    {
-      continue;
-    }
+      bool passes;
 
-    if (rfsRankGreater(handle, order) >= handle->capacity)
-    {
-      continue;
-    }
+      if (dirNext)
+      {
+        passes = inclusive ? (order >= cursor) : (order > cursor);
+      }
+      else
+      {
+        passes = (order < cursor);
+      }
 
-    if (!found || (dirNext ? order < outOrder : order > outOrder))
-    {
-      found = true;
-      *out = cand;
-      outOrder = order;
+      if (!passes)
+      {
+        continue;
+      }
+
+      rfsMember_t cand;
+      rfsBestCopy(handle, handle->keyBufB, &cand);
+
+      if (!cand.found || cand.pending || (uint32_t)cand.slot != idx)
+      {
+        continue;
+      }
+
+      if (rfsRankGreater(handle, order) >= handle->capacity)
+      {
+        continue;
+      }
+
+      if (!found || (dirNext ? order < outOrder : order > outOrder))
+      {
+        found = true;
+        *out = cand;
+        outOrder = order;
+      }
     }
   }
 
@@ -2741,6 +3104,29 @@ esp_err_t ringFileGetInfo(ringFileHandle_t *handle, ringFileInfo_t *outInfo)
   return ESP_OK;
 }
 
+//-- Drop the cached slot directory so the next query rescans storage.
+//-- A handle always sees its own writes; this is only needed by a
+//-- long-lived handle that must observe commits made through another
+//-- handle. Short-lived readers (open, query, close) never need it.
+esp_err_t ringFileCacheInvalidate(ringFileHandle_t *handle)
+{
+  if (handle == NULL)
+  {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  RFS_ENTER(handle);
+  free(handle->dir);
+  handle->dir = NULL;
+  free(handle->dirRecBuf);
+  handle->dirRecBuf = NULL;
+  handle->dirCount = 0;
+  handle->dirSlots = 0;
+  handle->dirReady = false;
+  RFS_EXIT(handle);
+  return ESP_OK;
+}
+
 esp_err_t ringFileSync(ringFileHandle_t *handle)
 {
   if (handle == NULL)
@@ -2823,41 +3209,83 @@ static bool rfsFindKthOldest(ringFileHandle_t *h, uint32_t k, rfsMember_t *out)
     memset(&best, 0, sizeof(best));
     uint32_t slots = rfsSlotCount(h);
 
-    for (uint32_t idx = 0; idx < slots; idx++)
+    if (rfsDirEnsure(h))
     {
-      rfsSlotHdr_t hdr;
-
-      if (!rfsSlotHeaderValid(h, idx, &hdr))
+      for (uint32_t i = 0; i < h->dirCount; i++)
       {
-        continue;
+        const rfsDirEntry_t *e = &h->dir[i];
+        uint64_t order = e->order;
+
+        if (havePrev && order <= prev)
+        {
+          continue;
+        }
+
+        if (!rfsDirEntryIsBest(h, e))
+        {
+          continue;
+        }
+
+        if (rfsRankGreater(h, order) >= h->capacity)
+        {
+          continue;
+        }
+
+        rfsMember_t cand;
+        memset(&cand, 0, sizeof(cand));
+        cand.found = true;
+        cand.seq = e->seq;
+        cand.rev = e->rev;
+        cand.slot = (int32_t)e->slot;
+        cand.pending = false;
+        cand.order = order;
+
+        if (!found || order < bestOrder)
+        {
+          found = true;
+          best = cand;
+          bestOrder = order;
+        }
       }
-
-      rfsExtractKey(h, h->slotBuf, h->keyBufB);
-      uint64_t order = rfsOrderOfRecord(h, h->slotBuf);
-
-      if (havePrev && order <= prev)
+    }
+    else
+    {
+      for (uint32_t idx = 0; idx < slots; idx++)
       {
-        continue;
-      }
+        rfsSlotHdr_t hdr;
 
-      rfsMember_t cand;
-      rfsBestCopy(h, h->keyBufB, &cand);
+        if (!rfsSlotHeaderValid(h, idx, &hdr))
+        {
+          continue;
+        }
 
-      if (!cand.found || cand.pending || (uint32_t)cand.slot != idx)
-      {
-        continue;
-      }
+        rfsExtractKey(h, h->slotBuf, h->keyBufB);
+        uint64_t order = rfsOrderOfRecord(h, h->slotBuf);
 
-      if (rfsRankGreater(h, order) >= h->capacity)
-      {
-        continue;
-      }
+        if (havePrev && order <= prev)
+        {
+          continue;
+        }
 
-      if (!found || order < bestOrder)
-      {
-        found = true;
-        best = cand;
-        bestOrder = order;
+        rfsMember_t cand;
+        rfsBestCopy(h, h->keyBufB, &cand);
+
+        if (!cand.found || cand.pending || (uint32_t)cand.slot != idx)
+        {
+          continue;
+        }
+
+        if (rfsRankGreater(h, order) >= h->capacity)
+        {
+          continue;
+        }
+
+        if (!found || order < bestOrder)
+        {
+          found = true;
+          best = cand;
+          bestOrder = order;
+        }
       }
     }
 
@@ -3210,6 +3638,8 @@ esp_err_t ringFileValidate(const char *path, ringFileValidation_t *outValidation
     free(probe.keyBufA);
     free(probe.keyBufB);
     free(probe.recBuf);
+    free(probe.dir);
+    free(probe.dirRecBuf);
   }
 
   rfsIoClose(fd);

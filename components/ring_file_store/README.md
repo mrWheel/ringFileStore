@@ -1,5 +1,5 @@
 <!--
- FileVersion: [4] 19-11-2026 - 15:25
+ FileVersion: [5] 20-11-2026 - 22:20
 
  ringFileStore - component README: usage, binary format, commit protocol.
  Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -147,6 +147,7 @@ locking, buffered mode and the commit protocol are mode-independent.
 | `ringFileIteratorGetSlot` | bucketId (`period % capacity`) of the record the cursor last returned — the logical slot (`RING_FILE_SLOT_STAGED` for an unflushed staged record). For diagnostics and test logging. |
 | `ringFileResize` | Change capacity through a verified candidate file plus an atomic rename switch. Shrink keeps the newest buckets that fit. Capacity ≥ 1. Persists the new capacity. |
 | `ringFileGetInfo` | count, capacity, payload size, stored record size, `schemaId`, granularity, storage size, pending count, dirty. |
+| `ringFileCacheInvalidate` | Drop the internal slot directory cache so the next query rescans. Only a long-lived handle that must observe commits made through another handle needs this; a handle always sees its own writes. |
 | `ringFileSync` | Commit pending buffered data and synchronize through the backend. |
 | `ringFileValidate` | Stand-alone read-only integrity check; distinguishes bad metadata from bad record slots and reports stray resize files. |
 | `ringFileBreakStaleLock` | Remove the `<path>.lck` lock file left by an interrupted run. Only for use right after a reset, before the first open, when no live handle can exist. |
@@ -279,6 +280,12 @@ this lands inside one COW block commit, on FATFS it is not atomic —
 a damaged header is reported as `..._ERR_CORRUPT` (a checksum detects
 corruption but cannot reconstruct; see durability).
 
+The membership and ranking tests above are served from a per-handle
+**slot directory cache** (one scan per disk epoch; see Complexity). The
+cache is a read-time accelerator only: the on-disk committed state is
+unchanged and the cache is always rebuilt from storage after a write
+through the handle, so recovery semantics never depend on it.
+
 ### Resize
 
 `ringFileResize` flushes staged data, then:
@@ -371,25 +378,35 @@ reopen. Reads remain available. Reopen runs the recovery rules above.
 
 ## Complexity and resource estimates
 
-With `n = capacity + 1` slot positions, bounded RAM independent of capacity:
+With `n = capacity + 1` slot positions:
 
-| Operation | Storage scans (worst case) |
+| Operation | Storage reads (worst case) |
 | --- | --- |
-| add (with bucket check), update, keyed read | O(n) slot reads per membership test; O(n²) slot-header reads overall |
-| oldest/newest | O(n²) |
-| iterator step | O(n²) |
-| open (count/nextSeq derivation) | O(n²) |
-| validate | O(n²) |
-| resize | O(n²) plus streaming candidate |
+| add (with bucket check), update, keyed read | O(n) scan after a write, then RAM |
+| oldest/newest | O(n) scan after a write, then RAM |
+| iterator step | RAM only; O(n) scan once per disk epoch |
+| open (count/nextSeq derivation) | O(n) |
+| validate | O(n) |
+| resize | record load + candidate streaming; membership tests O(n²) in RAM |
 
-The scan-one-slot-at-a-time design keeps RAM independent of capacity at
-the cost of CPU for large rings; typical logger depths (tens to a few
-hundred records) are fine.
+Committed-state queries answer from the per-handle **slot directory
+cache**: one scan of every slot (key, sequence, revision and period per
+valid slot) feeds all membership, ranking and neighbor selection in RAM.
+Any storage write through the handle bumps an internal disk epoch and
+forces exactly one rebuild on the next query. A long-lived handle that
+must observe commits made through **another** handle calls
+`ringFileCacheInvalidate()` to drop the cache; short-lived readers
+(open, query, close) never need it, and a handle always sees its own
+writes immediately.
 
-Per handle: a few hundred bytes plus `slotSize + 2 × 8` scratch, one
-`storedRecordSize` build buffer and, in buffered mode,
-`maxPendingRecords × slotSize` bytes. A 24-slot ring of 64-byte payloads
-with 8 buffered entries ≈ 1.4 KB RAM.
+The cache costs `(capacity + 1) × ~40 bytes` per handle plus one
+`storedRecordSize` build buffer; capacity stays bounded by
+`RFS_MAX_CAPACITY` (65536).
+
+Per handle: a few hundred bytes plus `slotSize + 2 × 8` scratch, two
+`storedRecordSize` build buffers (write image and directory scan) and, in
+buffered mode, `maxPendingRecords × slotSize` bytes. A 24-slot ring of
+64-byte payloads with 8 buffered entries ≈ 2.5 KB RAM.
 
 ## Filesystem, locking and task context
 

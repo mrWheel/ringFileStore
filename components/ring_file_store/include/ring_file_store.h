@@ -1,5 +1,5 @@
 //--
-//-- FileVersion: [6] 19-11-2026 - 15:25
+//-- FileVersion: [7] 20-11-2026 - 22:20
 //--
 //-- ringFileStore - public C API of the ring_file_store component.
 //-- Copyright (C) 2026 Willem Aandewiel (mrWheel)
@@ -380,6 +380,15 @@ esp_err_t ringFileIteratorGetSlot(ringFileHandle_t *handle,
 esp_err_t ringFileResize(ringFileHandle_t *handle, uint32_t newCapacity);
 
 esp_err_t ringFileGetInfo(ringFileHandle_t *handle, ringFileInfo_t *outInfo);
+
+//-- Drop the internal slot-directory cache so the next query rescans
+//-- storage. Committed-state queries (keyed reads, oldest/newest,
+//-- iteration, info counts) are served from one cached slot scan per disk
+//-- epoch; any write through this handle refreshes the cache automatically.
+//-- This call is only needed by a long-lived handle that must observe
+//-- commits made through another handle. Short-lived readers that open,
+//-- query and close never need it.
+esp_err_t ringFileCacheInvalidate(ringFileHandle_t *handle);
 
 //-- Commit pending buffered changes and synchronize through the backend.
 //-- A clean handle performs no write and no sync.

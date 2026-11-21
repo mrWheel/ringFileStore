@@ -1,4 +1,4 @@
-version: 0.1.2
+version: 0.1.3
 license: GPL-3.0-or-later
 description: Persistent fixed-capacity ring files for ESP-IDF
 url: "https://github.com/mrWheel/ringFileStore"
